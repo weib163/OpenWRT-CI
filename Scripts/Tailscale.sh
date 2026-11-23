@@ -46,16 +46,26 @@ fi
 cat > "$FILES_DIR/usr/bin/ts-autologin.sh" <<'EOF'
 #!/bin/sh
 # 开机后自动登录；登录成功就删掉密钥文件并关闭自己，失败则下次开机再试。
+# --recover：Tailscale 要求重新登录时由 fleet-agent 调用（比如服务器重装过）。
+#   密钥文件已经删掉的话，用只读分区里固件自带的那份；只试几次，不关闭开机自启（本来就关了）。
+RECOVER=0
+[ "${1:-}" = "--recover" ] && RECOVER=1
 KEY_FILE=/etc/ts-authkey
 SERVER_FILE=/etc/ts-loginserver
+if [ ! -s "$KEY_FILE" ] && [ "$RECOVER" = 1 ] && [ -s /rom/etc/ts-authkey ]; then
+	KEY_FILE=/rom/etc/ts-authkey
+fi
 [ -s "$KEY_FILE" ] || exit 0
+[ -s "$SERVER_FILE" ] || { [ "$RECOVER" = 1 ] && [ -s /rom/etc/ts-loginserver ] && SERVER_FILE=/rom/etc/ts-loginserver; }
 
 WANT_SERVER=""
 [ -s "$SERVER_FILE" ] && WANT_SERVER=$(cat "$SERVER_FILE")
 
 finish() {
-	rm -f "$KEY_FILE"
-	/etc/init.d/ts-autologin disable
+	if [ "$RECOVER" = 0 ]; then
+		rm -f /etc/ts-authkey
+		/etc/init.d/ts-autologin disable
+	fi
 	logger -t ts-autologin "$1"
 	exit 0
 }
@@ -72,8 +82,10 @@ current_server() {
 	tailscale debug prefs 2>/dev/null | sed -n 's/.*"ControlURL": *"\([^"]*\)".*/\1/p' | head -n 1
 }
 
+LIMIT=240
+[ "$RECOVER" = 1 ] && LIMIT=5
 i=0
-while [ $i -lt 240 ]; do
+while [ $i -lt $LIMIT ]; do
 	i=$((i + 1))
 
 	if ! pgrep tailscaled >/dev/null 2>&1; then
@@ -84,6 +96,8 @@ while [ $i -lt 240 ]; do
 	fi
 
 	EXTRA=""
+	# 恢复登录时已有旧设置，带 --reset 免得 tailscale up 因为参数不一致拒绝执行
+	[ "$RECOVER" = 1 ] && EXTRA="--reset"
 	if tailscale status >/dev/null 2>&1; then
 		if [ -z "$WANT_SERVER" ] || [ "$(current_server)" = "$WANT_SERVER" ]; then
 			finish "already logged in"
@@ -106,7 +120,11 @@ while [ $i -lt 240 ]; do
 	fi
 	sleep 30
 done
-logger -t ts-autologin "gave up for this boot, will retry next boot"
+if [ "$RECOVER" = 1 ]; then
+	logger -t ts-autologin "recover failed, fleet-agent will retry in an hour"
+else
+	logger -t ts-autologin "gave up for this boot, will retry next boot"
+fi
 EOF
 chmod 755 "$FILES_DIR/usr/bin/ts-autologin.sh"
 

@@ -71,6 +71,12 @@ jobs:
       - name: Checkout Projects
         uses: actions/checkout@main
 
+      - name: Test Fleet Agent
+        run: |
+          # 路由器同步脚本的测试先跑，不过就不编了（几秒钟）
+          python3 -m pip install --quiet --user lupa
+          python3 -m unittest discover -s Scripts/fleet/tests
+
       - name: Initialization Environment
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -188,12 +194,16 @@ jobs:
           $GITHUB_WORKSPACE/Scripts/Handles.sh
           $GITHUB_WORKSPACE/.github/scripts/prepare-i2c-tools.sh
 
+          # PassWall 2 的配置字段要和同步脚本对得上，对不上就停下
+          $GITHUB_WORKSPACE/Scripts/fleet/passwall2-contract.sh ./package/luci-app-passwall2
+
       - name: Custom Settings
         env:
           TS_AUTHKEY: ${{secrets.TS_AUTHKEY}}
           TS_LOGIN_SERVER: ${{secrets.TS_LOGIN_SERVER}}
           FW_ZIP_PASSWORD: ${{secrets.FW_ZIP_PASSWORD}}
           ROOT_PW_HASH: ${{secrets.ROOT_PW_HASH}}
+          FW_SIGN_PUBKEY: ${{vars.FW_SIGN_PUBKEY}}
         run: |
           cd ./wrt/
 
@@ -306,6 +316,45 @@ jobs:
             make clean -j$(nproc)
           fi
 
+      - name: Sign Firmware
+        if: ${{ !inputs.WRT_TEST }}
+        env:
+          FW_SIGN_KEY: ${{secrets.FW_SIGN_KEY}}
+          FW_SIGN_PUBKEY: ${{vars.FW_SIGN_PUBKEY}}
+        run: |
+          cd ./wrt/upload/
+
+          if [ -z "$FW_SIGN_KEY" ]; then
+            echo "FW_SIGN_KEY 未设置：升级包不签名，路由器不会远程升级到这个版本。"
+            echo "WRT_SIGN=否" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          # 用和路由器上同一个工具（usign）签名
+          git clone -q --depth 1 https://github.com/openwrt/usign /tmp/usign-src
+          cmake -S /tmp/usign-src -B /tmp/usign-build > /dev/null
+          make -s -C /tmp/usign-build
+          USIGN=/tmp/usign-build/usign
+
+          umask 077
+          printf '%s\n' "$FW_SIGN_KEY" | tr -d '\r' > /tmp/fw-sign.sec
+          printf '%s\n' "$FW_SIGN_PUBKEY" | tr -d '\r' > /tmp/fw-sign.pub
+          COUNT=0
+          for FILE in *sysupgrade*.bin; do
+            [ -f "$FILE" ] || continue
+            $USIGN -S -m "$FILE" -s /tmp/fw-sign.sec -x "$FILE.sig"
+            # 用编进固件的公钥再验一遍：两把钥匙不是一对的话，编出来的固件以后升级不了
+            if ! $USIGN -V -q -m "$FILE" -p /tmp/fw-sign.pub -x "$FILE.sig"; then
+              rm -f /tmp/fw-sign.sec
+              echo "::error::FW_SIGN_KEY 和 FW_SIGN_PUBKEY 不是一对（重新运行 ota-keygen.sh，两个一起换）"
+              exit 1
+            fi
+            COUNT=$((COUNT + 1))
+          done
+          shred -u /tmp/fw-sign.sec 2>/dev/null || rm -f /tmp/fw-sign.sec
+          echo "已签名 $COUNT 个升级包。"
+          echo "WRT_SIGN=是（$COUNT 个升级包）" >> $GITHUB_ENV
+
       - name: Encrypt Firmware
         if: ${{ !inputs.WRT_TEST }}
         env:
@@ -364,6 +413,7 @@ jobs:
             插件列表：${{env.WRT_LIST}}
 
             固件加密：${{env.WRT_ENC}}
+            升级签名：${{env.WRT_SIGN}}
 
   cache-rollover:
     name: Roll cache generations

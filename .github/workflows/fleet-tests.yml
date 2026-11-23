@@ -1,0 +1,44 @@
+#集群管理脚本的自动测试：改了路由器同步脚本、固件里的集群设置时自动跑（几十秒）
+name: Fleet-Tests
+
+on:
+  push:
+    paths:
+      - 'Scripts/fleet/**'
+      - 'Scripts/Fleet.sh'
+      - 'Scripts/Tailscale.sh'
+      - 'Scripts/Packages.sh'
+      - '.github/workflows/fleet-tests.yml'
+  pull_request:
+    paths:
+      - 'Scripts/fleet/**'
+      - 'Scripts/Fleet.sh'
+      - 'Scripts/Tailscale.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fleet agent unit tests
+        run: |
+          python3 -m pip install --quiet --user lupa
+          python3 -m unittest discover -s Scripts/fleet/tests -v
+
+      - name: Shell syntax
+        run: |
+          bash -n Scripts/Fleet.sh
+          bash -n Scripts/Tailscale.sh
+          bash -n Scripts/fleet/passwall2-contract.sh
+
+      - name: PassWall 2 fields (pinned version)
+        run: |
+          TAG=$(grep -oP 'UPDATE_PACKAGE "passwall2" "[^"]+" "\K[^"]+' Scripts/Packages.sh)
+          echo "PassWall 2 锁定版本：$TAG"
+          git clone -q --depth 1 --branch "$TAG" https://github.com/Openwrt-Passwall/openwrt-passwall2 /tmp/pw2
+          Scripts/fleet/passwall2-contract.sh /tmp/pw2/luci-app-passwall2

@@ -1,8 +1,8 @@
-"""fleet-agent（路由器同步脚本）测试：用 Lua 5.1（和 OpenWrt 同版本）跑真实脚本，
-UCI 和 luci.jsonc 用假实现；下发服务的回复直接用 fleet_server.py 生成，保证两边格式对得上。
+"""fleet-agent（路由器同步脚本）测试：用 Lua 5.1（和 OpenWrt 同版本）跑真实脚本，UCI 和命令执行用假的；
+下发服务的回复用 fixtures/server_responses.json（由私有仓库的服务器代码生成，那边有测试保证两边一致）。
 
 运行：python3 -m unittest discover -s Scripts/fleet/tests -v
-需要：pip install lupa；以及私有仓库里的 fleet/server/fleet_server.py（用环境变量 FLEET_SERVER_DIR 指定目录）。
+需要：pip install lupa
 """
 
 import copy
@@ -11,180 +11,18 @@ import os
 import sys
 import unittest
 
-from lupa import lua51
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from harness import TS_STATUS, AgentHarness, load_fixtures  # noqa: E402
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-AGENT = os.path.join(HERE, "..", "fleet-agent.lua")
-SERVER_DIR = os.environ.get("FLEET_SERVER_DIR", os.path.join(HERE, "..", "..", "..", "..", "openwrt-ci-private", "fleet", "server"))
-sys.path.insert(0, SERVER_DIR)
-import fleet_server as fs  # noqa: E402
-
-FAKE_UCI = r"""
-local function deepcopy(v)
-  if type(v) ~= "table" then return v end
-  local r = {}
-  for k, x in pairs(v) do r[k] = deepcopy(x) end
-  return r
-end
-local Cursor = {}
-Cursor.__index = Cursor
-function Cursor:find(config, name)
-  for i, s in ipairs(self.staged[config] or {}) do
-    if s[".name"] == name then return s, i end
-  end
-end
-function Cursor:foreach(config, stype, fn)
-  for _, s in ipairs(self.staged[config] or {}) do
-    if stype == nil or s[".type"] == stype then fn(deepcopy(s)) end
-  end
-end
-function Cursor:get(config, name, opt)
-  local s = self:find(config, name)
-  if not s then return nil end
-  if opt == nil then return s[".type"] end
-  return deepcopy(s[opt])
-end
-function Cursor:set(config, name, a, b)
-  self.staged[config] = self.staged[config] or {}
-  if b == nil then
-    local s = self:find(config, name)
-    if s then s[".type"] = a else table.insert(self.staged[config], { [".name"] = name, [".type"] = a }) end
-  else
-    local s = self:find(config, name)
-    assert(s, "set on missing section " .. name)
-    s[a] = deepcopy(b)
-  end
-  return true
-end
-function Cursor:delete(config, name, opt)
-  local s, i = self:find(config, name)
-  if not s then return false end
-  if opt then s[opt] = nil else table.remove(self.staged[config], i) end
-  return true
-end
-function Cursor:commit(config) self.committed[config] = deepcopy(self.staged[config]); self.commits = self.commits + 1 end
-function Cursor:revert(config) self.staged[config] = deepcopy(self.committed[config]) end
-function new_cursor(data)
-  return setmetatable({ committed = deepcopy(data), staged = deepcopy(data), commits = 0 }, Cursor)
-end
-return new_cursor
-"""
-
-DEFAULT_PW = [
-    {".name": "cfg01", ".type": "global", "enabled": "0", "node": "rulenode", "localhost_proxy": "1"},
-    {".name": "cfg02", ".type": "global_delay", "start_daemon": "1", "start_delay": "60"},
-    {".name": "examplenode", ".type": "nodes", "remarks": "Example", "type": "Xray", "protocol": "socks"},
-    {".name": "rulenode", ".type": "nodes", "protocol": "_shunt", "shunt_group": "CN"},
-    {".name": "CN", ".type": "shunt_rules", "group": "CN", "domain_list": "geosite:cn"},
-    {".name": "customer_node", ".type": "nodes", "remarks": "客户自己的", "type": "sing-box", "protocol": "vmess"},
-]
+FX = load_fixtures()
+BUILD_OLD = "26.11.20-10.00.00"
+FW_OLD = "1.1.0-26.11.20"
+BOARD = "jdcloud,re-cs-02"
+PUB = "untrusted comment: fleet firmware signing key public key\nRWQf6LRCGA9i5yJJmB0uO6gNhGeM6A1CLMNHnPeUX4s4lh7Qz7QzQ9wz\n"
 
 
-def server_response(status="active", on_expire="block", nodes=None, direct=("hs.example.com", "198.51.100.7")):
-    cfg = fs.Config(direct=list(direct))
-    if nodes is None:
-        sys.path.insert(0, os.path.join(SERVER_DIR, "tests"))
-        import test_fleet_server as t
-        nodes, _ = fs.convert_proxy_configs([t.reality_cfg("aaaaaaaa-1111-4111-8111-111111111111"),
-                                             t.ws_cfg("bbbbbbbb-2222-4222-8222-222222222222")])
-    return fs.build_response(cfg, status, on_expire, nodes)
-
-
-class AgentHarness:
-    def __init__(self):
-        self.lua = lua51.LuaRuntime(unpack_returned_tuples=True)
-        g = self.lua.globals()
-        jsonc = self.lua.table_from({"parse": self._parse, "stringify": self._stringify})
-        g.package.loaded["luci.jsonc"] = jsonc
-        g.FLEET_AGENT_LIBRARY = True
-        with open(AGENT, encoding="utf-8") as f:
-            src = f.read()
-        if src.startswith("#!"):
-            src = "--" + src[2:]
-        self.M = self.lua.execute(src)
-        self.new_cursor = self.lua.execute(FAKE_UCI)
-        self.files = {}
-        self.logs = []
-        self.commands = []
-        self.restarts = 0
-        self.screen_restarts = 0
-        self.exec_map = {}
-        env = self.M.env
-        env.exec = self._exec
-        env.run = lambda cmd: (self.commands.append(cmd), 0)[1]
-        env.read = lambda path: self.files.get(path)
-        env.write = lambda path, data: self.files.__setitem__(path, data) or True
-        env.remove = lambda path: self.files.pop(path, None)
-        env.log = lambda msg: self.logs.append(msg)
-        env.sleep = lambda n: None
-        env.restart_passwall = self._restart
-        env.restart_screen = self._restart_screen
-        self.now = 1800000000  # 整分钟、偶数分钟
-        env.now = lambda: self.now
-        self.cursor = self.new_cursor(self.to_lua({"passwall2": copy.deepcopy(DEFAULT_PW),
-                                                   "fleet": [{".name": "main", ".type": "agent", "enabled": "1",
-                                                              "server": "", "port": "8080"}]}))
-        env.cursor = lambda: self.cursor
-
-    # ---- JSON 桥
-    def to_lua(self, v):
-        if isinstance(v, dict):
-            return self.lua.table_from({k: self.to_lua(x) for k, x in v.items() if x is not None})
-        if isinstance(v, list):
-            return self.lua.table_from([self.to_lua(x) for x in v])
-        return v
-
-    def to_py(self, v):
-        if hasattr(v, "keys") and not isinstance(v, (str, bytes)):
-            keys = list(v.keys())
-            if keys and all(isinstance(k, int) for k in keys) and sorted(keys) == list(range(1, len(keys) + 1)):
-                return [self.to_py(v[k]) for k in sorted(keys)]
-            return {k: self.to_py(v[k]) for k in keys}
-        return v
-
-    def _parse(self, s):
-        try:
-            return self.to_lua(json.loads(s))
-        except (ValueError, TypeError):
-            return None
-
-    def _stringify(self, t):
-        return json.dumps(self.to_py(t), ensure_ascii=False)
-
-    def _exec(self, cmd):
-        self.commands.append(cmd)
-        for key, val in self.exec_map.items():
-            if key in cmd:
-                return val(cmd) if callable(val) else val
-        return ""
-
-    def _restart(self):
-        self.restarts += 1
-
-    def _restart_screen(self):
-        self.screen_restarts += 1
-
-    # ---- 便捷方法
-    def sections(self, stype=None):
-        out = {}
-        for s in self.to_py(self.cursor.committed["passwall2"]):
-            if stype is None or s[".type"] == stype:
-                out[s[".name"]] = s
-        return out
-
-    def global_opts(self):
-        return [s for s in self.to_py(self.cursor.committed["passwall2"]) if s[".type"] == "global"][0]
-
-    def validate(self, resp):
-        res = self.M.validate(self.to_lua(resp))
-        if isinstance(res, tuple):
-            return res
-        return res, None
-
-    def handle(self, resp, state=None):
-        cfg, err = self.validate(resp)
-        assert cfg is not None, err
-        return self.M.handle(self.cursor, cfg, self.to_lua(state or {}))
+def resp(name):
+    return copy.deepcopy(FX[name])
 
 
 class ValidateTests(unittest.TestCase):
@@ -192,27 +30,26 @@ class ValidateTests(unittest.TestCase):
         self.h = AgentHarness()
 
     def test_accepts_real_server_output(self):
-        cfg, err = self.h.validate(server_response())
+        cfg, err = self.h.validate(resp("active"))
         self.assertIsNotNone(cfg, err)
         py = self.h.to_py(cfg)
         self.assertEqual(len(py["nodes"]), 2)
         self.assertEqual(py["direct"], ["hs.example.com", "198.51.100.7"])
-        for status in ("pending", "expired", "limited", "disabled", "no_nodes"):
-            self.assertIsNotNone(self.h.validate(server_response(status))[0], status)
-        self.assertIsNotNone(self.h.validate({"schema": 1, "status": "unchanged", "version": "ab12"})[0])
+        for name in ("pending", "expired_block", "expired_direct", "limited", "disabled", "no_nodes", "unchanged"):
+            self.assertIsNotNone(self.h.validate(resp(name))[0], name)
 
     def test_rejects_bad_or_malicious_fields(self):
-        good = server_response()
+        good = resp("active")
         mutations = [
-            ("address", "1.2.3.4; rm -rf /"), ("address", "evil'host"), ("port", 0), ("port", 70000), ("port", "443x"),
-            ("uuid", "not-a-uuid"), ("protocol", "vmess"), ("transport", "grpc"), ("tls", False),
-            ("public_key", "abc'def"), ("short_id", "zz"), ("sni", "bad host"), ("flow", "xtls-rprx-direct"),
-            ("id", "../etc"), ("id", "x" * 30),
+            ("address", "1.2.3.4; rm -rf /"), ("address", "evil'host"), ("address", "2001:db8::1"), ("port", 0),
+            ("port", 70000), ("port", "443x"), ("uuid", "not-a-uuid"), ("protocol", "vmess"), ("transport", "grpc"),
+            ("tls", False), ("public_key", "abc'def"), ("short_id", "zz"), ("sni", "bad host"),
+            ("flow", "xtls-rprx-direct"), ("id", "../etc"), ("id", "x" * 30),
         ]
         for key, value in mutations:
-            resp = copy.deepcopy(good)
-            resp["nodes"][0][key] = value
-            cfg, err = self.h.validate(resp)
+            r = copy.deepcopy(good)
+            r["nodes"][0][key] = value
+            cfg, err = self.h.validate(r)
             self.assertIsNone(cfg, "%s=%r 应该被拒绝" % (key, value))
         bad_ws = copy.deepcopy(good)
         bad_ws["nodes"][1]["ws_path"] = "/a b'"
@@ -223,17 +60,41 @@ class ValidateTests(unittest.TestCase):
             self.assertIsNone(self.h.validate(top)[0], str(top)[:80])
 
     def test_long_interval_is_capped(self):
-        resp = server_response()
-        resp["auto"]["interval"] = "2h"
-        cfg, _ = self.h.validate(resp)
+        r = resp("active")
+        r["auto"]["interval"] = "2h"
+        cfg, _ = self.h.validate(r)
         self.assertEqual(self.h.to_py(cfg)["auto"]["interval"], "30m")
 
     def test_remark_cleaning_keeps_utf8_valid(self):
-        long = "菲律宾" * 40 + "'\"\x01"
-        cleaned = self.h.M.clean_remark(long, "fallback")
-        cleaned.encode("utf-8")  # 截断后仍是合法 UTF-8
+        cleaned = self.h.M.clean_remark("菲律宾" * 40 + "'\"\x01", "fallback")
+        cleaned.encode("utf-8")
         self.assertNotIn("'", cleaned)
         self.assertLessEqual(len(cleaned.encode("utf-8")), 96)
+
+    def test_hostname_rules(self):
+        M = self.h.M
+        self.assertTrue(M.is_hostname("cdn.example.com"))
+        self.assertFalse(M.is_hostname("1.2.3.4"))  # 是 IP 不是域名
+        self.assertFalse(M.is_node_address("2001:db8::1"))
+        self.assertTrue(M.is_node_address("203.0.113.10"))
+
+    def vo(self, o, board):
+        res = self.h.M.validate_ota(self.h.to_lua(o), board)
+        return res if isinstance(res, tuple) else (res, None)
+
+    def test_ota_validation(self):
+        good = resp("ota")
+        o, err = self.vo(good, BOARD)
+        self.assertIsNotNone(o, err)
+        for key, value in (("version", "latest"), ("board", "jdcloud,re-ss-01"), ("url", "/ota/../../etc/shadow"),
+                           ("url", "http://evil.example/fw.bin"), ("sig", "/ota/x.sig"), ("sha256", "abc"),
+                           ("size", 10), ("size", 10 ** 10)):
+            bad = dict(good, **{key: value})
+            o, err = self.vo(bad, BOARD)
+            self.assertIsNone(o, "%s=%r 应该被拒绝" % (key, value))
+        other = dict(good, url=good["url"].replace("26.11.24-01.23.45/", "26.11.25-00.00.00/"))
+        self.assertIsNone(self.vo(other, BOARD)[0])  # 路径里的版本要和 version 一致
+        self.assertIsNone(self.vo(good, "")[0])
 
 
 class ApplyTests(unittest.TestCase):
@@ -241,15 +102,13 @@ class ApplyTests(unittest.TestCase):
         self.h = AgentHarness()
 
     def test_active_writes_passwall2_sections(self):
-        self.assertTrue(self.h.handle(server_response()))
+        self.assertTrue(self.h.handle(resp("active")))
         nodes = self.h.sections("nodes")
         reality = nodes["fleet_haaaaaaaa11"]
-        self.assertEqual(reality["type"], "sing-box")
-        self.assertEqual(reality["protocol"], "vless")
+        self.assertEqual((reality["type"], reality["protocol"], reality["domain_strategy"]), ("sing-box", "vless", "ipv4_only"))
         self.assertEqual((reality["tls"], reality["reality"], reality["reality_publicKey"], reality["reality_shortId"],
                           reality["tls_serverName"], reality["flow"], reality["transport"], reality["port"]),
-                         ("1", "1", "Z84J2IelR9ch3k8VtlVhhs5ycBUlXA7wHBWcBrjqnAw", "a1b2c3d4", "www.microsoft.com",
-                          "xtls-rprx-vision", "tcp", "443"))
+                         ("1", "1", FX["public_key"], "a1b2c3d4", "www.microsoft.com", "xtls-rprx-vision", "tcp", "443"))
         ws = nodes["fleet_hbbbbbbbb22"]
         self.assertEqual((ws["transport"], ws["ws_path"], ws["ws_host"], ws["reality"], ws["alpn"]),
                          ("ws", "/ws-9f3k?ed=2048", "cdn.example.com", "0", "h2,http/1.1"))
@@ -265,253 +124,300 @@ class ApplyTests(unittest.TestCase):
                          ("CN", "domain:hs.example.com", "198.51.100.7"))
         g = self.h.global_opts()
         self.assertEqual((g["node"], g["enabled"]), ("fleet_shunt", "1"))
-        # 客户自己的节点、PassWall 2 自带的段都没动
         self.assertIn("customer_node", nodes)
         self.assertIn("examplenode", nodes)
         self.assertIn("CN", self.h.sections("shunt_rules"))
 
+    def test_ipv4_only_settings(self):
+        c = self.h.cursor
+        c.set(c, "passwall2", "cfg03", "ipv6_tproxy", "1")
+        c.commit(c, "passwall2")
+        self.h.handle(resp("active"))
+        g = self.h.global_opts()
+        self.assertEqual((g["direct_dns_query_strategy"], g["remote_dns_query_strategy"]), ("UseIPv4", "UseIPv4"))
+        self.assertEqual(self.h.section_of_type("global_forwarding")["ipv6_tproxy"], "0")
+
     def test_same_config_twice_does_not_write_flash(self):
-        resp = server_response()
-        self.assertTrue(self.h.handle(resp))
+        r = resp("active")
+        self.assertTrue(self.h.handle(r))
         commits = self.h.cursor.commits
-        self.assertFalse(self.h.handle(resp))
+        self.assertFalse(self.h.handle(r))
         self.assertEqual(self.h.cursor.commits, commits)
 
     def test_removed_node_is_deleted(self):
-        resp = server_response()
-        self.h.handle(resp)
-        resp2 = copy.deepcopy(resp)
-        resp2["nodes"] = resp2["nodes"][:1]
-        self.assertTrue(self.h.handle(resp2))
+        r = resp("active")
+        self.h.handle(r)
+        r2 = copy.deepcopy(r)
+        r2["nodes"] = r2["nodes"][:1]
+        self.assertTrue(self.h.handle(r2))
         nodes = self.h.sections("nodes")
         self.assertNotIn("fleet_hbbbbbbbb22", nodes)
         self.assertEqual(nodes["fleet_auto"]["urltest_node"], ["fleet_haaaaaaaa11"])
 
     def test_expired_block_keeps_nodes_direct_turns_off(self):
-        self.h.handle(server_response())
-        self.assertFalse(self.h.handle(server_response("expired", "block")))
+        self.h.handle(resp("active"))
+        self.assertFalse(self.h.handle(resp("expired_block")))
         self.assertIn("fleet_haaaaaaaa11", self.h.sections("nodes"))
         self.assertEqual(self.h.global_opts()["enabled"], "1")
-        self.assertTrue(self.h.handle(server_response("expired", "direct")))
+        self.assertTrue(self.h.handle(resp("expired_direct")))
         self.assertEqual(self.h.global_opts()["enabled"], "0")
-        self.assertIn("fleet_haaaaaaaa11", self.h.sections("nodes"))  # UUID 保留，续费即恢复
+        self.assertIn("fleet_haaaaaaaa11", self.h.sections("nodes"))
 
     def test_disabled_removes_uuids_and_blackholes_proxy(self):
-        self.h.handle(server_response())
-        self.assertTrue(self.h.handle(server_response("disabled", "block")))
+        self.h.handle(resp("active"))
+        self.assertTrue(self.h.handle(resp("disabled")))
         nodes = self.h.sections("nodes")
         self.assertFalse([n for n in nodes.values() if n.get("uuid") and n[".name"].startswith("fleet_")])
         shunt = nodes["fleet_shunt"]
         self.assertEqual((shunt["default_node"], shunt["ProxyFront"], shunt["CN"]), ("_blackhole", "_blackhole", "_direct"))
         self.assertEqual(self.h.global_opts()["enabled"], "1")
-        self.assertIn("fleet_direct", self.h.sections("shunt_rules"))  # 管理通道仍然直连
+        self.assertIn("fleet_direct", self.h.sections("shunt_rules"))
 
     def test_pending_only_touches_managed_router(self):
-        self.assertFalse(self.h.handle(server_response("pending")))
+        self.assertFalse(self.h.handle(resp("pending")))
         self.assertEqual(self.h.global_opts()["enabled"], "0")
-        self.h.handle(server_response())
-        self.assertTrue(self.h.handle(server_response("pending")))
+        self.h.handle(resp("active"))
+        self.assertTrue(self.h.handle(resp("pending")))
         self.assertEqual(self.h.global_opts()["enabled"], "0")
 
     def test_tampered_nodes_are_restored(self):
-        resp = server_response()
-        self.h.handle(resp)
-        snapshot = self.h.M.snapshot(self.h.cursor)
-        state = {"version": resp["version"], "status": "active", "snapshot": snapshot}
-        # 客户在后台改了 UUID
-        c = self.h.cursor
-        c.set(c, "passwall2", "fleet_haaaaaaaa11", "uuid", "00000000-0000-4000-8000-000000000000")
-        c.commit(c, "passwall2")
-        changed = self.h.handle({"schema": 1, "status": "unchanged", "version": resp["version"]}, state)
-        self.assertTrue(changed)
-        self.assertEqual(self.h.sections("nodes")["fleet_haaaaaaaa11"]["uuid"], fs_vless())
+        r = resp("active")
+        self.h.handle(r)
+        state = {"version": r["version"], "status": "active", "snapshot": self.h.M.snapshot(self.h.cursor)}
+        self.h.set_uci("passwall2", "fleet_haaaaaaaa11", "uuid", "00000000-0000-4000-8000-000000000000")
+        self.assertTrue(self.h.handle(resp("unchanged"), state))
+        self.assertEqual(self.h.sections("nodes")["fleet_haaaaaaaa11"]["uuid"], FX["vless_id"])
 
-
-def fs_vless():
-    sys.path.insert(0, os.path.join(SERVER_DIR, "tests"))
-    import test_fleet_server as t
-    return t.VLESS_ID
+    def test_ipv6_turned_back_on_is_noticed(self):
+        r = resp("active")
+        self.h.handle(r)
+        state = {"version": r["version"], "status": "active", "snapshot": self.h.M.snapshot(self.h.cursor)}
+        self.h.set_uci("passwall2", "cfg03", "ipv6_tproxy", "1")
+        self.assertTrue(self.h.handle(resp("unchanged"), state))
+        self.assertEqual(self.h.section_of_type("global_forwarding")["ipv6_tproxy"], "0")
 
 
 class RunTests(unittest.TestCase):
-    STATUS = {
-        "BackendState": "Running",
-        "Self": {"TailscaleIPs": ["100.64.0.20", "fd7a:115c:a1e0::20"]},
-        "Peer": {
-            "k1": {"HostName": "my-phone", "TailscaleIPs": ["100.64.0.2"], "Tags": None},
-            "k2": {"HostName": "fleet", "TailscaleIPs": ["100.64.0.9", "fd7a:115c:a1e0::9"], "Tags": ["tag:fleet"]},
-        },
-    }
-
     def setUp(self):
         self.h = AgentHarness()
-        self.h.files["/etc/openwrt_version"] = "r28000-abcdef\n"
-        self.h.exec_map["tailscale status --json"] = json.dumps(self.STATUS)
+        self.h.files["/etc/fleet/build_id"] = BUILD_OLD + "\n"
+        self.h.files["/etc/fleet-firmware"] = FW_OLD + "\n"
+        self.h.files["/tmp/sysinfo/board_name"] = BOARD + "\n"
+        self.h.exec_map["tailscale status --json"] = json.dumps(TS_STATUS)
+        self.h.exec_map["tailscale version"] = "1.90.6\n  tailscale commit: abc\n"
+        self.h.exec_map["luci-app-passwall2"] = "luci-app-passwall2-26.11.11-r1 noarch {feeds/x} (GPL-3.0) [installed]\n"
         self.h.exec_map["echo $PPID"] = "1234\n"
 
     def serve(self, body):
-        self.h.exec_map["uclient-fetch"] = lambda cmd: (json.dumps(body) if body is not None else "") + \
-            ("__FLEET_RC=0\n" if body is not None else "__FLEET_RC=4\n")
+        def fetch(cmd):
+            self.last_url = cmd.split("'")[1]
+            if body is None:
+                return "__FLEET_RC=4\n"
+            return (body if isinstance(body, str) else json.dumps(body)) + "__FLEET_RC=0\n"
+        self.h.exec_map["uclient-fetch -q -T 20 -O -"] = fetch
 
-    def test_full_run_applies_and_saves_state(self):
-        resp = server_response()
-        self.serve(resp)
-        self.assertEqual(self.h.M.main(self.h.lua.table_from(["--now"])), 0)
-        fetch = [c for c in self.h.commands if "uclient-fetch" in c][0]
-        self.assertIn("'http://100.64.0.9:8080/v1/config?ver=&fw=r28000-abcdef&agent=1.1.0'", fetch)
+    def query(self):
+        from urllib.parse import parse_qs, urlsplit
+        return {k: v[0] for k, v in parse_qs(urlsplit(self.last_url).query, keep_blank_values=True).items()}
+
+    def test_full_run_reports_and_saves_state(self):
+        r = resp("active")
+        self.serve(r)
+        self.assertEqual(self.h.main(), 0)
+        self.assertTrue(self.last_url.startswith("http://100.64.0.9:8080/v1/config?"))
+        q = self.query()
+        self.assertEqual((q["ver"], q["fw"], q["build"], q["agent"], q["board"], q["ts"], q["pw"], q["err"]),
+                         ("", FW_OLD, BUILD_OLD, "1.2.0", BOARD, "1.90.6", "26.11.11-r1", ""))
         self.assertEqual(self.h.restarts, 1)
         state = json.loads(self.h.files["/etc/fleet/state.json"])
-        self.assertEqual((state["version"], state["status"]), (resp["version"], "active"))
-        self.assertIn("/etc/fleet/last.json", self.h.files)
-        # 第二轮：带上版本号，服务端说没变化 → 不重启
-        self.serve({"schema": 1, "status": "unchanged", "version": resp["version"], "refresh_seconds": 600})
-        self.h.M.main(self.h.lua.table_from(["--now"]))
-        fetch2 = [c for c in self.h.commands if "uclient-fetch" in c][-1]
-        self.assertIn("ver=" + resp["version"], fetch2)
+        self.assertEqual((state["version"], state["status"]), (r["version"], "active"))
+        self.serve(resp("unchanged"))
+        self.h.main()
+        self.assertEqual(self.query()["ver"], r["version"])
         self.assertEqual(self.h.restarts, 1)
 
+    def test_old_firmware_without_build_id(self):
+        del self.h.files["/etc/fleet/build_id"]
+        del self.h.files["/etc/fleet-firmware"]
+        self.h.files["/etc/openwrt_version"] = "r28000-abcdef\n"
+        self.serve(resp("active"))
+        self.h.main()
+        self.assertEqual((self.query()["fw"], self.query()["build"]), ("r28000-abcdef", ""))
+
     def test_server_unreachable_keeps_config(self):
-        self.serve(server_response())
-        self.h.M.main(self.h.lua.table_from(["--now"]))
+        self.serve(resp("active"))
+        self.h.main()
         before = self.h.sections()
         self.serve(None)
-        self.h.M.main(self.h.lua.table_from(["--now"]))
+        self.h.main()
         self.assertEqual(self.h.sections(), before)
         self.assertTrue(any("保持现有配置" in m for m in self.h.logs))
 
-    def test_garbage_response_is_discarded(self):
-        self.h.exec_map["uclient-fetch"] = "<html>oops</html>__FLEET_RC=0\n"
-        self.h.M.main(self.h.lua.table_from(["--now"]))
+    def test_bad_response_is_reported_next_time_then_cleared(self):
+        self.serve("<html>oops</html>")
+        self.h.main()
         self.assertEqual(self.h.global_opts()["enabled"], "0")
-        self.assertTrue(any("不合格" in m for m in self.h.logs))
+        self.assertEqual(self.h.files.get("/etc/fleet/last_error"), "bad_response")
+        self.serve(resp("active"))
+        self.h.main()
+        self.assertEqual(self.query()["err"], "bad_response")
+        self.assertNotIn("/etc/fleet/last_error", self.h.files)
 
-    def test_tailscale_down_skips(self):
+    def test_apply_failure_is_reported(self):
+        c = self.h.cursor
+        c.delete(c, "passwall2", "cfg01")  # 没有 global 段，写不进去
+        c.commit(c, "passwall2")
+        self.serve(resp("active"))
+        self.h.main()
+        self.assertEqual(self.h.files.get("/etc/fleet/last_error"), "apply")
+        self.assertIsNone(json.loads(self.h.files["/etc/fleet/state.json"]).get("version"))
+
+    def test_needs_login_triggers_relogin_once_an_hour(self):
         self.h.exec_map["tailscale status --json"] = json.dumps({"BackendState": "NeedsLogin"})
-        self.serve(server_response())
-        self.h.M.main(self.h.lua.table_from(["--now"]))
-        self.assertFalse([c for c in self.h.commands if "uclient-fetch" in c])
+        self.serve(resp("active"))
+        self.h.main()
+        self.h.main()
+        self.assertEqual(self.h.relogins, 1)
+        self.assertFalse(any("uclient-fetch" in c for c in self.h.commands))
+        self.h.now += 3601
+        self.h.main()
+        self.assertEqual(self.h.relogins, 2)
+        self.h.exec_map["tailscale status --json"] = json.dumps(TS_STATUS)
+        self.h.main()
+        self.assertEqual(self.query()["err"], "ts_relogin")
+
+    def test_stopped_tailscale_is_not_touched(self):
+        self.h.exec_map["tailscale status --json"] = json.dumps({"BackendState": "Stopped"})
+        self.h.main()
+        self.assertEqual(self.h.relogins, 0)
 
     def test_disabled_in_uci_does_nothing(self):
-        c = self.h.cursor
-        c.set(c, "fleet", "main", "enabled", "0")
-        c.commit(c, "fleet")
-        self.serve(server_response())
-        self.h.M.main(self.h.lua.table_from(["--now"]))
+        self.h.set_uci("fleet", "main", "enabled", "0")
+        self.serve(resp("active"))
+        self.h.main()
         self.assertFalse([c for c in self.h.commands if "uclient-fetch" in c])
 
-    def test_reports_firmware_version(self):
-        self.h.files["/etc/fleet-firmware"] = "1.1.0-26.11.23\n"
-        self.serve(server_response())
-        self.h.M.main(self.h.lua.table_from(["--now"]))
-        self.assertIn("&fw=1.1.0-26.11.23&", [c for c in self.h.commands if "uclient-fetch" in c][-1])
-        self.h.files["/etc/fleet-firmware"] = "bad version!\n"  # 不合格就退回 OpenWrt 源码版本
-        self.h.M.main(self.h.lua.table_from(["--now"]))
-        self.assertIn("&fw=r28000-abcdef&", [c for c in self.h.commands if "uclient-fetch" in c][-1])
-
     def test_url_quoting_is_safe(self):
-        q = self.h.M.shell_quote("a'b")
-        self.assertEqual(q, "'a'\\''b'")
+        self.assertEqual(self.h.M.shell_quote("a'b"), "'a'\\''b'")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-class EndToEndTests(unittest.TestCase):
-    """真实的 fleet-server（HTTP）+ 假 Remnawave + 路由器脚本，走完整个生命周期。"""
-
-    NAME = "re-cs-02-1c2ab34d5e6f"
+class OtaTests(RunTests):
+    """继承 RunTests 的准备工作；回复里带升级信息。"""
 
     def setUp(self):
-        import threading
-        import urllib.error
-        import urllib.request
-        sys.path.insert(0, os.path.join(SERVER_DIR, "tests"))
-        import test_fleet_server as t
-        self.t = t
-        self.panel = t.FakePanel()
-        cfg = fs.Config.from_env({"REMNAWAVE_URL": self.panel.url, "REMNAWAVE_TOKEN": "test-token", "FLEET_DB": ":memory:",
-                                  "FLEET_CACHE_TTL": "0", "FLEET_DIRECT": "hs.example.com", "FLEET_RATE_PER_MINUTE": "1000"})
-        cfg.port = 0
-        whois = fs.WhoisCache(cfg, lambda c, ip: t.whois_router("node-1", self.NAME), ttl=0)
-        self.fleet = fs.Fleet(cfg, fs.Store(":memory:"), fs.RemnawaveClient(cfg), whois)
-        self.server = fs.make_server(cfg, self.fleet, "127.0.0.1")
-        port = self.server.server_address[1]
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        super().setUp()
+        self.h.files["/etc/fleet/fw-sign.pub"] = PUB
+        self.ota = resp("ota")
+        self.h.exec_map["command -v usign"] = "/usr/bin/usign\n"
+        self.h.exec_map["df -k /tmp"] = "480000\n"
+        self.h.exec_map["wc -c"] = "%d\n" % self.ota["size"]
+        self.h.exec_map["sha256sum"] = "%s  /tmp/fleet-ota/fw.bin\n" % self.ota["sha256"]
 
-        self.h = AgentHarness()
-        self.h.files["/etc/openwrt_version"] = "r28000\n"
-        status = copy.deepcopy(RunTests.STATUS)
-        self.h.exec_map["tailscale status --json"] = json.dumps(status)
-        self.h.exec_map["echo $PPID"] = "99\n"
-        c = self.h.cursor
-        c.set(c, "fleet", "main", "server", "127.0.0.1")
-        c.set(c, "fleet", "main", "port", str(port))
-        c.commit(c, "fleet")
+    def serve_ota(self, **change):
+        r = resp("active")
+        r["ota"] = dict(self.ota, **change)
+        self.serve(r)
 
-        def fetch(cmd):
-            url = cmd.split("'")[1]
-            try:
-                with urllib.request.urlopen(url, timeout=5) as r:
-                    return r.read().decode() + "__FLEET_RC=0\n"
-            except urllib.error.HTTPError:
-                return "__FLEET_RC=8\n"  # uclient-fetch 遇到非 200 时退出码非 0
-        self.h.exec_map["uclient-fetch"] = fetch
+    def errors(self):
+        return self.h.files.get("/etc/fleet/last_error")
 
-    def tearDown(self):
-        self.server.shutdown()
-        self.panel.close()
-
-    def cycle(self):
-        self.assertEqual(self.h.M.main(self.h.lua.table_from(["--now"])), 0)
-
-    def test_lifecycle(self):
-        t = self.t
-        # 1. 新路由器：面板里还没有用户 → 待开通，PassWall 2 保持关闭
-        self.cycle()
-        self.assertEqual(self.h.global_opts()["enabled"], "0")
-        self.assertEqual(self.fleet.store.get("node-1")["last_status"], "pending")
-        # 2. 面板里建好同名用户 → 自动绑定，写入节点并打开
-        self.panel.users[self.NAME] = t.make_user(self.NAME)
-        self.panel.configs[self.NAME] = [t.reality_cfg("aaaaaaaa-1111-4111-8111-111111111111"),
-                                         t.ws_cfg("bbbbbbbb-2222-4222-8222-222222222222")]
-        self.cycle()
-        nodes = self.h.sections("nodes")
-        self.assertIn("fleet_haaaaaaaa11", nodes)
-        self.assertEqual((self.h.global_opts()["node"], self.h.global_opts()["enabled"]), ("fleet_shunt", "1"))
-        restarts = self.h.restarts
-        # 3. 没变化 → 不重启
-        self.cycle()
-        self.assertEqual(self.h.restarts, restarts)
-        # 4. 面板里换了地址 → 下一轮更新
-        self.panel.configs[self.NAME][0]["address"] = "203.0.113.99"
-        self.cycle()
-        self.assertEqual(self.h.sections("nodes")["fleet_haaaaaaaa11"]["address"], "203.0.113.99")
-        # 5. 到期（默认 block）→ 节点保留，PassWall 2 开着；设了 EXPIRE_DIRECT → 关掉
-        self.panel.users[self.NAME]["status"] = "EXPIRED"
-        self.cycle()
+    def test_happy_path_upgrades(self):
+        self.serve_ota()
+        self.h.main()
+        self.assertEqual(self.h.upgrades, ["/tmp/fleet-ota/fw.bin"])
+        cmds = "\n".join(self.h.commands)
+        self.assertIn("'http://100.64.0.9:8080%s'" % self.ota["url"], cmds)
+        self.assertIn("usign -V -q -m '/tmp/fleet-ota/fw.bin' -p '/etc/fleet/fw-sign.pub' -x '/tmp/fleet-ota/fw.bin.sig'", cmds)
+        self.assertIn("sysupgrade -T '/tmp/fleet-ota/fw.bin'", cmds)
+        att = json.loads(self.h.files["/etc/fleet/ota.json"])
+        self.assertEqual((att["version"], att["tries"]), (self.ota["version"], 1))
+        self.assertIsNone(self.errors())
+        # 节点配置照样写好了（先更新配置，再升级）
         self.assertIn("fleet_haaaaaaaa11", self.h.sections("nodes"))
-        self.assertEqual(self.h.global_opts()["enabled"], "1")
-        self.panel.users[self.NAME]["tag"] = "EXPIRE_DIRECT"
-        self.cycle()
-        self.assertEqual(self.h.global_opts()["enabled"], "0")
-        # 6. 续费 → 恢复
-        self.panel.users[self.NAME].update(status="ACTIVE", tag=None)
-        self.cycle()
-        self.assertEqual(self.h.global_opts()["enabled"], "1")
-        # 7. 面板暂时连不上 → 保持现状
-        before = self.h.sections()
-        self.panel.down = True
-        self.cycle()
-        self.assertEqual(self.h.sections(), before)
-        self.panel.down = False
-        # 8. 停用 → 节点和 UUID 删掉，翻墙流量丢弃，管理通道直连规则还在
-        self.panel.users[self.NAME]["status"] = "DISABLED"
-        self.cycle()
-        nodes = self.h.sections("nodes")
-        self.assertNotIn("fleet_haaaaaaaa11", nodes)
-        self.assertEqual(nodes["fleet_shunt"]["default_node"], "_blackhole")
-        self.assertIn("fleet_direct", self.h.sections("shunt_rules"))
+
+    def check_refused(self, code):
+        self.h.main()
+        self.assertEqual(self.h.upgrades, [])
+        self.assertEqual(self.errors(), code)
+
+    def test_no_public_key(self):
+        del self.h.files["/etc/fleet/fw-sign.pub"]
+        self.serve_ota()
+        self.check_refused("ota_nokey")
+
+    def test_bad_checksum(self):
+        self.h.exec_map["sha256sum"] = "%s  /tmp/fleet-ota/fw.bin\n" % ("0" * 64)
+        self.serve_ota()
+        self.check_refused("ota_sha256")
+
+    def test_bad_signature(self):
+        self.h.run_map["usign -V"] = 256
+        self.serve_ota()
+        self.check_refused("ota_sig")
+
+    def test_truncated_download(self):
+        self.h.exec_map["wc -c"] = "100\n"
+        self.serve_ota()
+        self.check_refused("ota_download")
+
+    def test_download_failure(self):
+        self.h.run_map["uclient-fetch"] = 1024
+        self.serve_ota()
+        self.check_refused("ota_download")
+
+    def test_image_rejected_by_sysupgrade(self):
+        self.h.run_map["sysupgrade -T"] = 256
+        self.serve_ota()
+        self.check_refused("ota_image")
+
+    def test_not_enough_memory(self):
+        self.h.exec_map["df -k /tmp"] = "1000\n"
+        self.serve_ota()
+        self.check_refused("ota_space")
+
+    def test_wrong_board(self):
+        self.serve_ota(board="jdcloud,re-ss-01")
+        self.check_refused("ota_board")
+
+    def test_ota_switched_off_in_uci(self):
+        self.h.set_uci("fleet", "main", "ota", "0")
+        self.serve_ota()
+        self.h.main()
+        self.assertEqual(self.h.upgrades, [])
+        self.assertFalse(any("fleet-ota" in c for c in self.h.commands))
+
+    def test_gives_up_after_two_tries_and_reports_failure(self):
+        self.serve_ota()
+        self.h.main()
+        self.assertEqual(len(self.h.upgrades), 1)
+        # 升级没成功，还是老版本：过了 15 分钟报一次 ota_failed
+        self.h.now += 600
+        self.h.main()
+        self.assertNotEqual(self.query()["err"], "ota_failed")
+        self.h.now += 600
+        self.h.main()
+        self.assertEqual(self.query()["err"], "ota_failed")
+        self.assertEqual(len(self.h.upgrades), 2)  # 第二次尝试
+        self.h.now += 3600
+        self.h.main()
+        self.h.main()
+        self.assertEqual(len(self.h.upgrades), 2)  # 同一版本最多试两次
+
+    def test_success_clears_attempt_record(self):
+        self.serve_ota()
+        self.h.main()
+        self.h.files["/etc/fleet/build_id"] = self.ota["version"] + "\n"
+        self.serve(resp("unchanged"))
+        self.h.main()
+        self.assertNotIn("/etc/fleet/ota.json", self.h.files)
+        self.assertEqual(self.query()["build"], self.ota["version"])
+
+    def test_old_firmware_cannot_be_upgraded(self):
+        # 没有编译号（比如 1.1.0 之前的固件）：型号对上也不升级，等手动刷
+        del self.h.files["/etc/fleet/build_id"]
+        self.serve_ota()
+        self.h.main()
+        self.assertEqual(self.h.upgrades, [])
 
 
 # ---------------------------------------------------------------- 温度、超温上报、屏幕
@@ -525,7 +431,7 @@ SCREEN = {".name": "general", ".type": "settings", "enabled": "1", "fleet_defaul
 
 
 class HealthTests(unittest.TestCase):
-    STATUS = copy.deepcopy(RunTests.STATUS)
+    STATUS = copy.deepcopy(TS_STATUS)
     STATUS["Self"]["HostName"] = "re-cs-02-1c2ab34d5e6f"
     STATUS["Self"]["Online"] = True
 
@@ -545,7 +451,7 @@ class HealthTests(unittest.TestCase):
             "fleet": self.h.to_py(c.committed["fleet"]),
             "athena_led": [dict(SCREEN)],
         }))
-        self.serve(server_response())
+        self.serve(resp("active"))
 
     def set_temp(self, celsius):
         self.h.files[THERMAL % (4, "temp")] = "%d\n" % int(celsius * 1000)
@@ -561,7 +467,7 @@ class HealthTests(unittest.TestCase):
         return [c for c in self.h.commands if "nc 127.0.0.1" in c]
 
     def health(self):
-        self.assertEqual(self.h.M.main(self.h.lua.table_from(["--health"])), 0)
+        self.assertEqual(self.h.main("--health"), 0)
 
     def screen_conf(self):
         return [s for s in self.h.to_py(self.h.cursor.committed["athena_led"]) if s[".name"] == "general"][0]
@@ -589,12 +495,12 @@ class HealthTests(unittest.TestCase):
         self.assertEqual((r.hot, r.since, r.changed), (False, None, True))
 
     def test_sync_reports_temperature(self):
-        self.h.M.main(self.h.lua.table_from(["--now"]))
+        self.h.main("--now")
         self.assertIn("&temp=73&hot=0'", self.fetches()[-1])
         self.assertEqual(self.h.files[self.h.M.REPORTED_FILE], "0")
 
     def test_overheat_is_reported_at_once_and_only_once(self):
-        self.h.M.main(self.h.lua.table_from(["--now"]))
+        self.h.main("--now")
         n = len(self.fetches())
         self.set_temp(95)
         self.health()
@@ -614,16 +520,14 @@ class HealthTests(unittest.TestCase):
         self.health()
         self.health()
         self.assertEqual(len(self.fetches()), 2)
-        self.serve(server_response())
+        self.serve(resp("active"))
         self.health()
         self.assertEqual(self.h.files[self.h.M.REPORTED_FILE], "1")
         self.health()
         self.assertEqual(len(self.fetches()), 3)
 
     def test_threshold_from_fleet_config(self):
-        c = self.h.cursor
-        c.set(c, "fleet", "main", "temp_alert", "75")
-        c.commit(c, "fleet")
+        self.h.set_uci("fleet", "main", "temp_alert", "75")
         self.set_temp(80)
         self.health()
         self.assertIn("&hot=1'", self.fetches()[-1])
@@ -632,9 +536,7 @@ class HealthTests(unittest.TestCase):
             self.assertEqual(self.h.M.temp_threshold(self.h.lua.table_from({"temp_alert": bad})), 90)
 
     def test_fleet_disabled_still_runs_screen_but_never_syncs(self):
-        c = self.h.cursor
-        c.set(c, "fleet", "main", "enabled", "0")
-        c.commit(c, "fleet")
+        self.h.set_uci("fleet", "main", "enabled", "0")
         self.set_temp(99)
         self.health()
         self.assertEqual(self.fetches(), [])
@@ -655,9 +557,7 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(self.screen_conf()["custom_content"], "00000A")
 
     def test_screen_text_set_by_admin_is_kept(self):
-        c = self.h.cursor
-        c.set(c, "athena_led", "general", "custom_content", "HELLO")
-        c.commit(c, "athena_led")
+        self.h.set_uci("athena_led", "general", "custom_content", "HELLO")
         self.health()
         self.assertEqual(self.screen_conf()["custom_content"], "HELLO")
         self.assertEqual(self.h.screen_restarts, 0)
@@ -711,6 +611,16 @@ class HealthTests(unittest.TestCase):
         self.health()
         self.assertIn("'PAY BY 12-01'", self.screen_cmds()[-1])
 
+    def test_needs_login_shows_on_screen_and_still_relogins(self):
+        # 每分钟的检查只管屏幕；重新登录由每 10 分钟的同步去做（一小时最多一次）
+        self.health()
+        self.h.exec_map["tailscale status --json"] = json.dumps({"BackendState": "NeedsLogin"})
+        self.health()
+        self.assertIn("'TS DOWN'", self.screen_cmds()[-1])
+        self.assertEqual(self.h.relogins, 0)
+        self.h.main("--now")
+        self.assertEqual(self.h.relogins, 1)
+
     def test_screen_command_is_quoted(self):
         cmd = self.h.M.screen_command(8377, 8, "A'B")
         self.assertEqual(cmd, "printf 'show 8 %s\\n' 'A'\\''B' | nc 127.0.0.1 8377 >/dev/null 2>&1 &")
@@ -736,62 +646,28 @@ class NoticeTests(unittest.TestCase):
 
     def test_notice_saved_and_kept_when_unchanged(self):
         h = self.h
-        h.files["/etc/openwrt_version"] = "r28000\n"
-        h.exec_map["tailscale status --json"] = json.dumps(RunTests.STATUS)
+        h.exec_map["tailscale status --json"] = json.dumps(TS_STATUS)
         h.exec_map["echo $PPID"] = "5\n"
-        resp = server_response()
-        resp["notice"] = "pay by 12-01"
-        h.exec_map["uclient-fetch"] = json.dumps(resp) + "__FLEET_RC=0\n"
-        h.M.main(h.lua.table_from(["--now"]))
+        r = resp("notice")
+        self.assertEqual(r["notice"], "PAY BY 12-01")  # 服务器发出来的就是规范写法
+        h.exec_map["uclient-fetch"] = json.dumps(r) + "__FLEET_RC=0\n"
+        h.main()
         self.assertEqual(json.loads(h.files["/etc/fleet/state.json"])["notice"], "PAY BY 12-01")
-        h.exec_map["uclient-fetch"] = json.dumps({"schema": 1, "status": "unchanged", "version": resp["version"]}) + "__FLEET_RC=0\n"
-        h.M.main(h.lua.table_from(["--now"]))
+        h.exec_map["uclient-fetch"] = json.dumps(resp("unchanged")) + "__FLEET_RC=0\n"
+        h.main()
         self.assertEqual(json.loads(h.files["/etc/fleet/state.json"])["notice"], "PAY BY 12-01")
         # 新配置里没有留言：清掉
-        h.exec_map["uclient-fetch"] = json.dumps(server_response()) + "__FLEET_RC=0\n"
-        h.M.main(h.lua.table_from(["--now"]))
+        h.exec_map["uclient-fetch"] = json.dumps(resp("active")) + "__FLEET_RC=0\n"
+        h.main()
         self.assertNotIn("notice", json.loads(h.files["/etc/fleet/state.json"]))
 
     def test_bad_notice_does_not_block_config(self):
-        resp = server_response()
-        resp["notice"] = "续费"
-        cfg, err = self.h.validate(resp)
+        r = resp("active")
+        r["notice"] = "续费"
+        cfg, err = self.h.validate(r)
         self.assertIsNotNone(cfg, err)
         self.assertIsNone(self.h.to_py(cfg).get("notice"))
 
 
-class EndToEndHealthTests(EndToEndTests):
-    """真实 fleet-server + 路由器脚本：超温告警、面板备注、屏幕留言。"""
-
-    test_lifecycle = None  # 父类的完整生命周期这里不重复跑
-
-    def test_overheat_and_notice(self):
-        t = self.t
-        self.panel.users[self.NAME] = t.make_user(self.NAME)
-        self.panel.configs[self.NAME] = [t.reality_cfg("aaaaaaaa-1111-4111-8111-111111111111")]
-        self.h.files[THERMAL % (4, "type")] = "cpu-thermal\n"
-        self.h.files[THERMAL % (4, "temp")] = "71000\n"
-        self.cycle()
-        node = self.fleet.store.get("node-1")
-        self.assertEqual((node["username"], node["temp"], node["hot"]), (self.NAME, 71, 0))
-
-        # 超温：每分钟的检查马上上报，管理页数据和面板备注都更新
-        self.h.files[THERMAL % (4, "temp")] = "95000\n"
-        self.assertEqual(self.h.M.main(self.h.lua.table_from(["--health"])), 0)
-        self.assertEqual(self.fleet.store.get("node-1")["hot"], 1)
-        self.assertTrue(self.fleet.notes.flush())
-        self.assertEqual(self.panel.users[self.NAME]["description"], "⚠ 路由器温度过高：95℃\n张三 13800000000")
-
-        # 后台写留言：下一轮同步路由器就拿到
-        self.fleet.store.set_notice("node-1", "PAY BY 12-01")
-        self.cycle()
-        self.assertEqual(json.loads(self.h.files["/etc/fleet/state.json"])["notice"], "PAY BY 12-01")
-
-        # 降温：马上报“恢复”，备注那一行去掉
-        self.h.files[THERMAL % (4, "temp")] = "80000\n"
-        self.h.M.main(self.h.lua.table_from(["--health"]))
-        self.assertEqual(self.fleet.store.get("node-1")["hot"], 0)
-        self.assertTrue(self.fleet.notes.flush())
-        self.assertEqual(self.panel.users[self.NAME]["description"], "张三 13800000000")
-        kinds = [e["kind"] for e in self.fleet.store.events(10, ["overheat", "overheat_clear"])]
-        self.assertEqual(kinds, ["overheat_clear", "overheat"])
+if __name__ == "__main__":
+    unittest.main()

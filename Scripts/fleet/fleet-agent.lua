@@ -1,20 +1,31 @@
 #!/usr/bin/lua
--- fleet-agent：从下发服务拉取本机的节点配置，写进 PassWall 2；同步时顺带上报 CPU 温度。
+-- fleet-agent：从下发服务拉取本机的节点配置，写进 PassWall 2；同步时顺带上报 CPU 温度、版本和出错情况，
+-- 按下发服务的安排做批量升级（OTA）。
 --
 -- 开机运行一次，之后每 10 分钟由 cron 运行；调试时执行 fleet-agent --now（跳过随机等待）。
 -- fleet-agent --health 由 cron 每分钟运行：超温告警开始或解除时马上同步一次（不等 10 分钟），
 --   并在雅典娜屏幕上插播提示（断网、管理通道断开、到期、后台留言），把屏幕编号填成设备名最后 6 位。
--- 只改名字以 fleet_ 开头的节点和分流规则；客户自己加的节点不动。
+-- 只改名字以 fleet_ 开头的节点和分流规则；客户自己加的节点不动。翻墙只走 IPv4。
+-- Tailscale 掉了登录（比如服务器重装过）时，用固件里的登录密钥自己重新登录（一小时最多一次）。
 -- 日志：logread -e fleet-agent
 --
--- 依赖固件里已有的 lua、luci-lib-jsonc（luci.jsonc）、libuci-lua（uci）、uclient-fetch、tailscale。
+-- 依赖固件里已有的 lua、luci-lib-jsonc（luci.jsonc）、libuci-lua（uci）、uclient-fetch、tailscale；
+-- 批量升级另外要 usign 和 /etc/fleet/fw-sign.pub。
 
 local M = {}
-M.VERSION = "1.1.0"
+M.VERSION = "1.2.0"
 M.PW = "passwall2"
 M.PREFIX = "fleet_"
 M.STATE_FILE = "/etc/fleet/state.json"
 M.LAST_FILE = "/etc/fleet/last.json"
+M.ERROR_FILE = "/etc/fleet/last_error"
+M.OTA_FILE = "/etc/fleet/ota.json"
+-- 编译号（编译时间，如 26.11.23-14.05.33）：批量升级靠它认版本，每次编译都不一样
+M.BUILD_FILE = "/etc/fleet/build_id"
+M.PUBKEY = "/etc/fleet/fw-sign.pub"
+M.OTA_DIR = "/tmp/fleet-ota"
+M.OTA_MAX_TRIES = 2
+M.RELOGIN_STAMP = "/tmp/fleet-relogin"
 M.LOCK_DIR = "/var/lock/fleet-agent.lock"
 M.FLEET_TAG = "tag:fleet"
 -- 温度和屏幕：状态都放内存盘（/tmp），每分钟写也不伤闪存
@@ -60,14 +71,22 @@ function M.is_hostname(s)
 	if type(s) ~= "string" or #s < 1 or #s > 253 then return false end
 	if s:sub(-1) == "." then s = s:sub(1, -2) end
 	if s == "" or s:find("..", 1, true) or s:sub(1, 1) == "." then return false end
+	local last
 	for label in s:gmatch("[^%.]+") do
 		if #label > 63 or not label:match("^[%w][%w%-]*$") or label:sub(-1) == "-" then return false end
+		last = label
 	end
-	return true
+	-- 最后一段全是数字的其实是 IP，不算域名
+	return last ~= nil and not last:match("^%d+$")
 end
 
 function M.is_address(s)
 	return M.is_ipv4(s) or M.is_ipv6(s) or M.is_hostname(s)
+end
+
+-- 节点地址只收 IPv4 和域名：翻墙只走 IPv4
+function M.is_node_address(s)
+	return M.is_ipv4(s) or M.is_hostname(s)
 end
 
 function M.is_cidr(s)
@@ -85,6 +104,10 @@ end
 
 function M.is_path(s)
 	return type(s) == "string" and #s <= 201 and s:match("^/[%w%._~%%!%$&%(%)%*%+,;=:@/%?%-]*$") ~= nil
+end
+
+function M.is_build_id(s)
+	return type(s) == "string" and s:match("^%d%d%.%d%d%.%d%d%-%d%d%.%d%d%.%d%d$") ~= nil
 end
 
 -- 去掉控制字符和引号，按 UTF-8 安全地截到 limit 字节
@@ -130,7 +153,7 @@ function M.validate_node(n)
 	if not id or #id > 24 or not id:match("^[%w_]+$") then return nil, "id" end
 	if n.protocol ~= "vless" then return nil, "protocol" end
 	local address = str(n.address)
-	if not address or not M.is_address(address) then return nil, "address" end
+	if not address or not M.is_node_address(address) then return nil, "address" end
 	local port = tonumber(n.port)
 	if not port or port ~= math.floor(port) or port < 1 or port > 65535 then return nil, "port" end
 	local uuid = str(n.uuid)
@@ -232,6 +255,22 @@ function M.validate(r)
 	return out
 end
 
+-- 升级信息：版本、型号、下载路径、校验和、大小都得对得上，否则不理
+function M.validate_ota(o, board)
+	if type(o) ~= "table" then return nil, "不是对象" end
+	local v = str(o.version)
+	if not M.is_build_id(v) then return nil, "version" end
+	if str(o.board) ~= board or not board or board == "" then return nil, "board" end
+	local pat = "^/ota/([%d%.%-]+)/[%w%._,%+%-]+$"
+	local url, sig = str(o.url), str(o.sig)
+	if not url or url:match(pat) ~= v or not sig or sig ~= url .. ".sig" then return nil, "url" end
+	local sha = str(o.sha256)
+	if not sha or #sha ~= 64 or not sha:match("^%x+$") then return nil, "sha256" end
+	local size = tonumber(o.size)
+	if not size or size ~= math.floor(size) or size < 1024 or size > 200 * 1024 * 1024 then return nil, "size" end
+	return { version = v, board = board, url = url, sig = sig, sha256 = sha:lower(), size = size }
+end
+
 -- ------------------------------------------------------------ 生成要写入的 UCI 段
 local function node_section(node)
 	local o = {
@@ -240,6 +279,8 @@ local function node_section(node)
 		tls = "1", tls_allowInsecure = "0", transport = node.transport,
 		utls = "1", fingerprint = node.fingerprint,
 		reality = node.reality and "1" or "0",
+		-- 节点地址是域名时只解析 IPv4
+		domain_strategy = "ipv4_only",
 	}
 	if node.flow then o.flow = node.flow end
 	if node.sni then o.tls_serverName = node.sni end
@@ -316,6 +357,19 @@ function M.global_section(c)
 	return g
 end
 
+local function first_section(c, stype)
+	local name
+	c:foreach(M.PW, stype, function(s) name = name or s[".name"] end)
+	return name
+end
+
+-- 只用 IPv4：远程、直连两路 DNS 都只要 IPv4 结果，不走 IPv6 透明代理
+local IPV4_ONLY = {
+	{ "global", "remote_dns_query_strategy", "UseIPv4" },
+	{ "global", "direct_dns_query_strategy", "UseIPv4" },
+	{ "global_forwarding", "ipv6_tproxy", "0" },
+}
+
 function M.snapshot(c)
 	local lines = {}
 	for _, stype in ipairs({ "nodes", "shunt_rules" }) do
@@ -343,10 +397,16 @@ function M.snapshot(c)
 		lines[#lines + 1] = "global|node=" .. tostring(c:get(M.PW, g, "node"))
 			.. "|enabled=" .. tostring(c:get(M.PW, g, "enabled"))
 	end
+	local extra = {}
+	for _, item in ipairs(IPV4_ONLY) do
+		local sec = first_section(c, item[1])
+		extra[#extra + 1] = item[2] .. "=" .. tostring(sec and c:get(M.PW, sec, item[2]))
+	end
+	lines[#lines + 1] = "ipv4|" .. table.concat(extra, "|")
 	return table.concat(lines, "\n")
 end
 
--- 用 plan 替换全部 fleet_ 段，设主节点和总开关；有变化才提交。返回 changed, err
+-- 用 plan 替换全部 fleet_ 段，设主节点、总开关和只用 IPv4；有变化才提交。返回 changed, err
 function M.apply(c, plan, enabled)
 	local g = M.global_section(c)
 	if not g then return false, "PassWall 2 配置里没有 global 段" end
@@ -369,8 +429,11 @@ function M.apply(c, plan, enabled)
 	end
 	if has_shunt then c:set(M.PW, g, "node", M.PREFIX .. "shunt") end
 	c:set(M.PW, g, "enabled", enabled and "1" or "0")
-	local d
-	c:foreach(M.PW, "global_delay", function(s) d = d or s[".name"] end)
+	for _, item in ipairs(IPV4_ONLY) do
+		local sec = first_section(c, item[1])
+		if sec and c:get(M.PW, sec, item[2]) ~= item[3] then c:set(M.PW, sec, item[2], item[3]) end
+	end
+	local d = first_section(c, "global_delay")
 	if d and c:get(M.PW, d, "start_daemon") ~= "1" then c:set(M.PW, d, "start_daemon", "1") end
 	if M.snapshot(c) == before then
 		c:revert(M.PW)
@@ -434,6 +497,10 @@ M.env = {
 	now = function() return os.time() end,
 	restart_passwall = function() os.execute("/etc/init.d/passwall2 restart >/dev/null 2>&1 &") end,
 	restart_screen = function() os.execute("/etc/init.d/athena_led restart >/dev/null 2>&1 &") end,
+	-- Tailscale 掉了登录（比如服务器重装过）：用固件里的登录密钥重新登录
+	relogin = function() os.execute("/usr/bin/ts-autologin.sh --recover >/dev/null 2>&1 &") end,
+	-- 保留配置升级；等几秒让日志写完
+	upgrade = function(img) os.execute("( sleep 5; sysupgrade " .. shell_quote(img) .. " ) >/dev/null 2>&1 &") end,
 }
 
 local function json()
@@ -442,6 +509,10 @@ end
 
 local function urlencode(s)
 	return (tostring(s):gsub("[^%w%-%._~]", function(ch) return string.format("%%%02X", ch:byte()) end))
+end
+
+local function trim(s)
+	return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
 -- 在 tailscale status --json 里找带 tag:fleet 标签的下发服务器，返回它的 IPv4
@@ -471,6 +542,12 @@ function M.fetch(url, timeout)
 	return body
 end
 
+-- 下载到文件；成功返回 true
+function M.download(url, path, timeout)
+	return M.env.run("uclient-fetch -q -T " .. tonumber(timeout or 60) .. " -O " .. shell_quote(path) .. " "
+		.. shell_quote(url) .. " >/dev/null 2>&1") == 0
+end
+
 function M.read_json(path)
 	local data = M.env.read(path)
 	if not data or data == "" then return nil end
@@ -484,7 +561,7 @@ function M.write_json(path, v)
 end
 
 local function read_conf(c)
-	local conf = { enabled = "1", server = "", port = "8080", timeout = "20", temp_alert = "" }
+	local conf = { enabled = "1", server = "", port = "8080", timeout = "20", temp_alert = "", ota = "1" }
 	c:foreach("fleet", "agent", function(s)
 		for k in pairs(conf) do
 			if s[k] ~= nil then conf[k] = s[k] end
@@ -495,12 +572,53 @@ end
 
 -- 报给管理页“固件”一栏：优先用我们的固件版本号（/etc/fleet-firmware，如 1.1.0-26.11.23），
 -- 老固件没有这个文件就用 OpenWrt 源码版本
-local function firmware_version()
+local function safe_text(v, limit)
+	v = trim(v)
+	if v == "" or #v > (limit or 40) or not v:match("^[%w%._%+%-]+$") then return "" end
+	return v
+end
+
+function M.firmware_version()
 	for _, path in ipairs({ "/etc/fleet-firmware", "/etc/openwrt_version" }) do
-		local v = (M.env.read(path) or ""):gsub("%s+", "")
-		if v ~= "" and #v <= 40 and v:match("^[%w%._%+%-]+$") then return v end
+		local v = safe_text(M.env.read(path))
+		if v ~= "" then return v end
 	end
 	return ""
+end
+
+-- 编译号：批量升级认版本用；老固件没有返回 ""
+function M.build_id()
+	local b = trim(M.env.read(M.BUILD_FILE))
+	return M.is_build_id(b) and b or ""
+end
+
+function M.board_name()
+	local b = trim(M.env.read("/tmp/sysinfo/board_name"))
+	if #b > 64 or not b:match("^[a-z0-9][a-z0-9,%._%-]*$") then return "" end
+	return b
+end
+
+function M.tailscale_version()
+	return safe_text((M.env.exec("tailscale version 2>/dev/null"):match("^[^\n]*")))
+end
+
+function M.passwall_version()
+	local out = M.env.exec("(apk list -I luci-app-passwall2 || opkg list-installed luci-app-passwall2) 2>/dev/null")
+	local v = out:match("luci%-app%-passwall2%-(%d[%w%._%-]*)") or out:match("luci%-app%-passwall2 %- (%S+)")
+	return safe_text(v)
+end
+
+-- 上一轮记下的错误代码（报给服务器，管理页显示、连续出错会告警）
+function M.last_error()
+	local e = trim(M.env.read(M.ERROR_FILE))
+	if #e > 32 or not e:match("^[a-z0-9_]*$") then return "" end
+	return e
+end
+
+local function save_error(code)
+	code = code or ""
+	if code == M.last_error() then return end
+	if code == "" then M.env.remove(M.ERROR_FILE) else M.env.write(M.ERROR_FILE, code) end
 end
 
 -- ------------------------------------------------------------ 温度
@@ -693,6 +811,73 @@ function M.handle(c, resp, state)
 	return false
 end
 
+-- 上次升级没成功（路由器还是老版本）：报一次 ota_failed
+function M.check_last_upgrade(build)
+	local att = M.read_json(M.OTA_FILE)
+	if not att or type(att.version) ~= "string" then return nil end
+	if att.version == build then
+		M.env.remove(M.OTA_FILE)
+		return nil
+	end
+	local started = tonumber(att.started) or 0
+	if not att.reported and M.env.now() - started > 900 then
+		att.reported = true
+		M.write_json(M.OTA_FILE, att)
+		M.env.log("上次升级到 " .. att.version .. " 没有成功，还在运行 " .. tostring(build))
+		return "ota_failed"
+	end
+	return nil
+end
+
+-- 批量升级：下载、核对大小和 SHA-256、验签、sysupgrade -T 检查，都通过才升级。
+-- 返回 (错误代码 或 nil, 是否已经开始升级)
+function M.ota(o, base)
+	local pub = M.env.read(M.PUBKEY)
+	if not pub or pub == "" or not M.env.exec("command -v usign 2>/dev/null"):match("usign") then
+		return "ota_nokey", false
+	end
+	local att = M.read_json(M.OTA_FILE) or {}
+	local tries = (att.version == o.version) and (tonumber(att.tries) or 0) or 0
+	if tries >= M.OTA_MAX_TRIES then return nil, false end
+	-- 刚开始升级不到 15 分钟：可能还在刷写、马上要重启，别重复下载
+	if tries > 0 and M.env.now() - (tonumber(att.started) or 0) < 900 then return nil, false end
+	local free_kb = tonumber(M.env.exec("df -k /tmp 2>/dev/null | awk 'NR==2 {print $4}'"):match("%d+") or "0")
+	if free_kb * 1024 < o.size * 1.2 + 16 * 1024 * 1024 then return "ota_space", false end
+
+	local img, sig = M.OTA_DIR .. "/fw.bin", M.OTA_DIR .. "/fw.bin.sig"
+	local function cleanup() M.env.run("rm -rf " .. M.OTA_DIR) end
+	cleanup()
+	M.env.run("mkdir -p " .. M.OTA_DIR)
+	M.env.log("开始下载升级包 " .. o.version .. "（" .. math.floor(o.size / 1048576) .. "MB）")
+	if not M.download(base .. o.url, img, 900) or not M.download(base .. o.sig, sig, 60) then
+		cleanup()
+		return "ota_download", false
+	end
+	local size = tonumber((M.env.exec("wc -c < " .. shell_quote(img)):match("%d+")) or "0")
+	if size ~= o.size then
+		cleanup()
+		return "ota_download", false
+	end
+	local sum = M.env.exec("sha256sum " .. shell_quote(img)):match("^(%x+)")
+	if not sum or sum:lower() ~= o.sha256 then
+		cleanup()
+		return "ota_sha256", false
+	end
+	if M.env.run("usign -V -q -m " .. shell_quote(img) .. " -p " .. shell_quote(M.PUBKEY)
+		.. " -x " .. shell_quote(sig)) ~= 0 then
+		cleanup()
+		return "ota_sig", false
+	end
+	if M.env.run("sysupgrade -T " .. shell_quote(img) .. " >/dev/null 2>&1") ~= 0 then
+		cleanup()
+		return "ota_image", false
+	end
+	M.write_json(M.OTA_FILE, { version = o.version, tries = tries + 1, started = M.env.now() })
+	M.env.log("升级包校验通过，开始升级到 " .. o.version .. "（保留配置），路由器会自动重启")
+	M.env.upgrade(img)
+	return nil, true
+end
+
 -- 每台路由器用自己的内网地址做随机种子，200 台同时被 cron 叫醒也会错开请求
 local function seed_from(text)
 	local n = os.time()
@@ -707,6 +892,17 @@ function M.run(opts)
 	if conf.enabled ~= "1" then return 0 end
 
 	local ok, ts = pcall(json().parse, M.env.exec("tailscale status --json 2>/dev/null"))
+	if ok and type(ts) == "table" and ts.BackendState == "NeedsLogin" then
+		-- 一小时最多试一次，免得服务器那边出问题时一直重试
+		local last = tonumber(trim(M.env.read(M.RELOGIN_STAMP))) or 0
+		if M.env.now() - last >= 3600 then
+			M.env.write(M.RELOGIN_STAMP, tostring(M.env.now()))
+			M.env.log("Tailscale 需要重新登录，用固件里的登录密钥重新登录")
+			M.env.relogin()
+			save_error("ts_relogin")
+		end
+		return 0
+	end
 	if not ok or type(ts) ~= "table" or ts.BackendState ~= "Running" then
 		M.env.log("Tailscale 没登录或没在运行，跳过这一轮")
 		return 0
@@ -725,11 +921,15 @@ function M.run(opts)
 	local port = tonumber(conf.port) or 8080
 	if port < 1 or port > 65535 then port = 8080 end
 
+	local build, board = M.build_id(), M.board_name()
+	local err = M.check_last_upgrade(build) or M.last_error()
 	local state = M.read_json(M.STATE_FILE) or {}
 	local ver = (type(state.version) == "string" and state.version:match("^%x*$")) and state.version or ""
 	local host = M.is_ipv6(server) and ("[" .. server .. "]") or server
-	local url = string.format("http://%s:%d/v1/config?ver=%s&fw=%s&agent=%s", host, port, ver,
-		urlencode(firmware_version()), urlencode(M.VERSION))
+	local base = string.format("http://%s:%d", host, port)
+	local url = string.format("%s/v1/config?ver=%s&fw=%s&build=%s&agent=%s&board=%s&ts=%s&pw=%s&err=%s",
+		base, ver, urlencode(M.firmware_version()), urlencode(build), urlencode(M.VERSION), urlencode(board),
+		urlencode(M.tailscale_version()), urlencode(M.passwall_version()), urlencode(err))
 	-- 顺带上报 CPU 温度和是否超温（下发服务据此在管理页和面板用户备注里显示告警）
 	local health = M.health_check(M.temp_threshold(conf), M.env.now())
 	if health.temp then
@@ -741,16 +941,22 @@ function M.run(opts)
 		return 0
 	end
 	local pok, raw = pcall(json().parse, body)
-	local resp, err = M.validate(pok and raw or nil)
+	local resp, verr = M.validate(pok and raw or nil)
 	if not resp then
-		M.env.log("下发的配置不合格（" .. tostring(err) .. "），整份丢弃，保持现有配置")
+		M.env.log("下发的配置不合格（" .. tostring(verr) .. "），整份丢弃，保持现有配置")
+		save_error("bad_response")
 		return 0
 	end
 	if health.temp then
 		M.env.write(M.REPORTED_FILE, health.hot and "1" or "0")
 	end
 
-	local changed = M.handle(c, resp, state)
+	local new_err = ""
+	local hok, changed = pcall(M.handle, c, resp, state)
+	if not hok then
+		M.env.log("写 PassWall 2 配置出错：" .. tostring(changed))
+		new_err, changed = "apply", false
+	end
 	if changed then
 		M.env.restart_passwall()
 		M.env.log("配置已更新（" .. resp.status .. "），重启 PassWall 2")
@@ -763,11 +969,30 @@ function M.run(opts)
 		snapshot = M.snapshot(c),
 		notice = unchanged and M.clean_notice(state.notice) or resp.notice,
 	}
+	if not hok then new_state.version = nil end -- 写失败了：下次要完整配置
 	if new_state.version ~= state.version or new_state.status ~= state.status
 		or new_state.snapshot ~= state.snapshot or new_state.on_expire ~= state.on_expire
 		or new_state.notice ~= state.notice then
 		M.write_json(M.STATE_FILE, new_state) -- 只在有变化时写闪存
 	end
+
+	if type(raw) == "table" and raw.ota ~= nil and conf.ota == "1" then
+		local o, why = M.validate_ota(raw.ota, board)
+		if build == "" then
+			-- 没有编译号就认不出升级成没成功：只能手动刷
+			M.env.log("这版固件没有编译号，不参加批量升级")
+		elseif not o then
+			M.env.log("升级信息不合格（" .. tostring(why) .. "），不升级")
+			if why == "board" then new_err = "ota_board" end
+		else
+			local code = M.ota(o, base)
+			if code then
+				M.env.log("这次没有升级：" .. code)
+				new_err = code
+			end
+		end
+	end
+	save_error(new_err)
 	return 0
 end
 
