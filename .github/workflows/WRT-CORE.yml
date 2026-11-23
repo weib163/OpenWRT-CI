@@ -185,16 +185,18 @@ jobs:
           TS_AUTHKEY: ${{secrets.TS_AUTHKEY}}
           TS_LOGIN_SERVER: ${{secrets.TS_LOGIN_SERVER}}
           FW_ZIP_PASSWORD: ${{secrets.FW_ZIP_PASSWORD}}
+          ROOT_PW_HASH: ${{secrets.ROOT_PW_HASH}}
         run: |
           cd ./wrt/
 
-          # 公开仓库的发布页谁都能下载：带登录密钥的固件必须加密，否则直接停止
-          if [[ "$WRT_TEST" != 'true' && -n "$TS_AUTHKEY" && -z "$FW_ZIP_PASSWORD" ]]; then
-            echo "::error::已设置 TS_AUTHKEY 但没有设置 FW_ZIP_PASSWORD，为防止密钥随固件公开，停止编译。"
+          # 公开仓库的发布页谁都能下载：带登录密钥或 root 密码的固件必须加密，否则直接停止
+          if [[ "$WRT_TEST" != 'true' && ( -n "$TS_AUTHKEY" || -n "$ROOT_PW_HASH" ) && -z "$FW_ZIP_PASSWORD" ]]; then
+            echo "::error::已设置 TS_AUTHKEY 或 ROOT_PW_HASH 但没有设置 FW_ZIP_PASSWORD，为防止它们随固件公开，停止编译。"
             exit 1
           fi
 
           $GITHUB_WORKSPACE/Scripts/Tailscale.sh
+          $GITHUB_WORKSPACE/Scripts/Fleet.sh
 
           if [[ "${WRT_CONFIG,,}" == *"test"* ]]; then
             cat $GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt >> .config
