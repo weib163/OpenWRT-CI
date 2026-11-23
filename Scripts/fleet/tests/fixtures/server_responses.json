@@ -85,12 +85,63 @@
     "status": "no_nodes",
     "version": "f48c5929e06799a8"
   },
+  "notice": {
+    "auto": {
+      "interval": "3m",
+      "tolerance": 50,
+      "url": "https://www.gstatic.com/generate_204"
+    },
+    "direct": [
+      "hs.example.com",
+      "198.51.100.7"
+    ],
+    "nodes": [
+      {
+        "address": "203.0.113.10",
+        "fingerprint": "chrome",
+        "flow": "xtls-rprx-vision",
+        "id": "haaaaaaaa11",
+        "port": 443,
+        "protocol": "vless",
+        "public_key": "Z84J2IelR9ch3k8VtlVhhs5ycBUlXA7wHBWcBrjqnAw",
+        "reality": true,
+        "remarks": "菲律宾1-REALITY",
+        "short_id": "a1b2c3d4",
+        "sni": "www.microsoft.com",
+        "tls": true,
+        "transport": "tcp",
+        "uuid": "3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90"
+      },
+      {
+        "address": "cdn.example.com",
+        "alpn": "h2,http/1.1",
+        "fingerprint": "chrome",
+        "id": "hbbbbbbbb22",
+        "port": 443,
+        "protocol": "vless",
+        "reality": false,
+        "remarks": "菲律宾1-CDN备用",
+        "sni": "cdn.example.com",
+        "tls": true,
+        "transport": "ws",
+        "uuid": "3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90",
+        "ws_host": "cdn.example.com",
+        "ws_path": "/ws-9f3k?ed=2048"
+      }
+    ],
+    "notice": "PAY BY 12-01",
+    "on_expire": "block",
+    "refresh_seconds": 600,
+    "schema": 1,
+    "status": "active",
+    "version": "a97bf1c6608f21c4"
+  },
   "ota": {
     "board": "jdcloud,re-cs-02",
     "sha256": "ad7facb2586fc6e966c004d7d1d16b024f5805ff7cb47c7a85dabd8b48892ca7",
-    "sig": "/ota/26.11.24-01.23.45/qualcommax-ipq60xx-jdcloud_re-cs-02-squashfs-sysupgrade-VIKINGYFY-owrt-WIFI-YES-26.11.24-01.23.45.bin.sig",
+    "sig": "/ota/26.11.24-01.23.45/ipq60xx-jdcloud_re-cs-02-squashfs-sysupgrade-v1.2.0-VIKINGYFY-main-WIFI-NO-26.11.24-01.23.45.bin.sig",
     "size": 4096,
-    "url": "/ota/26.11.24-01.23.45/qualcommax-ipq60xx-jdcloud_re-cs-02-squashfs-sysupgrade-VIKINGYFY-owrt-WIFI-YES-26.11.24-01.23.45.bin",
+    "url": "/ota/26.11.24-01.23.45/ipq60xx-jdcloud_re-cs-02-squashfs-sysupgrade-v1.2.0-VIKINGYFY-main-WIFI-NO-26.11.24-01.23.45.bin",
     "version": "26.11.24-01.23.45"
   },
   "pending": {
