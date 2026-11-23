@@ -1,5 +1,6 @@
 #设备平台
 CONFIG_TARGET_qualcommax=y
 CONFIG_TARGET_qualcommax_ipq60xx=y
-#设备列表：只编京东云亚瑟 RE-SS-01
+#设备列表：京东云雅典娜 RE-CS-02（主力机型）+ 亚瑟 RE-SS-01（已有的旧机，顺带编一份）
+CONFIG_TARGET_DEVICE_qualcommax_ipq60xx_DEVICE_jdcloud_re-cs-02=y
 CONFIG_TARGET_DEVICE_qualcommax_ipq60xx_DEVICE_jdcloud_re-ss-01=y
