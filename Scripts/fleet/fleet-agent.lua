@@ -493,10 +493,14 @@ local function read_conf(c)
 	return conf
 end
 
+-- 报给管理页“固件”一栏：优先用我们的固件版本号（/etc/fleet-firmware，如 1.1.0-26.11.23），
+-- 老固件没有这个文件就用 OpenWrt 源码版本
 local function firmware_version()
-	local v = (M.env.read("/etc/openwrt_version") or ""):gsub("%s+", "")
-	if not v:match("^[%w%._%+%-]+$") or #v > 40 then return "" end
-	return v
+	for _, path in ipairs({ "/etc/fleet-firmware", "/etc/openwrt_version" }) do
+		local v = (M.env.read(path) or ""):gsub("%s+", "")
+		if v ~= "" and #v <= 40 and v:match("^[%w%._%+%-]+$") then return v end
+	end
+	return ""
 end
 
 -- ------------------------------------------------------------ 温度

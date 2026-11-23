@@ -13,6 +13,11 @@ SRC="$GITHUB_WORKSPACE/Scripts/fleet"
 mkdir -p "$FILES_DIR/usr/bin" "$FILES_DIR/etc/config" "$FILES_DIR/etc/init.d" "$FILES_DIR/etc/uci-defaults"
 
 install -m 755 "$SRC/fleet-agent.lua" "$FILES_DIR/usr/bin/fleet-agent"
+# 固件版本号 + 编译日期，例如 1.1.0-26.11.23：fleet-agent 同步时报给管理页“固件”一栏
+if [ -n "$WRT_VER" ]; then
+	printf '%s-%s\n' "$WRT_VER" "${WRT_DATE%%-*}" > "$FILES_DIR/etc/fleet-firmware"
+	echo "固件版本：$(cat "$FILES_DIR/etc/fleet-firmware")"
+fi
 # 屏幕出厂设置：只有装了屏幕驱动的雅典娜会用到，其他机型开机时自己跳过
 install -m 755 "$SRC/screen-defaults.sh" "$FILES_DIR/etc/uci-defaults/94-fleet-screen"
 

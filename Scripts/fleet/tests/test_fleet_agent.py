@@ -399,6 +399,15 @@ class RunTests(unittest.TestCase):
         self.h.M.main(self.h.lua.table_from(["--now"]))
         self.assertFalse([c for c in self.h.commands if "uclient-fetch" in c])
 
+    def test_reports_firmware_version(self):
+        self.h.files["/etc/fleet-firmware"] = "1.1.0-26.11.23\n"
+        self.serve(server_response())
+        self.h.M.main(self.h.lua.table_from(["--now"]))
+        self.assertIn("&fw=1.1.0-26.11.23&", [c for c in self.h.commands if "uclient-fetch" in c][-1])
+        self.h.files["/etc/fleet-firmware"] = "bad version!\n"  # 不合格就退回 OpenWrt 源码版本
+        self.h.M.main(self.h.lua.table_from(["--now"]))
+        self.assertIn("&fw=r28000-abcdef&", [c for c in self.h.commands if "uclient-fetch" in c][-1])
+
     def test_url_quoting_is_safe(self):
         q = self.h.M.shell_quote("a'b")
         self.assertEqual(q, "'a'\\''b'")

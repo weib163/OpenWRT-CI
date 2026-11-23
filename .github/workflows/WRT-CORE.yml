@@ -108,7 +108,15 @@ jobs:
           WRT_CACHE_PREFIX="wrt-$WRT_CACHE_SOURCE-$WRT_CACHE_BRANCH-$WRT_CACHE_TARGET"
           WRT_WIFI=$(grep -oE 'WIFI-(YES|NO)$' <<< "${WRT_CONFIG^^}" || true); WRT_WIFI=${WRT_WIFI:-none}
 
+          # 固件版本号：仓库根目录 FIRMWARE_VERSION，改了功能就手动加一（例如 1.1.0 -> 1.1.1）
+          WRT_VER=$(tr -d '[:space:]' < ./FIRMWARE_VERSION)
+          if [[ ! "$WRT_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::FIRMWARE_VERSION 格式不对（$WRT_VER），应该像 1.1.0"
+            exit 1
+          fi
+
           {
+            echo "WRT_VER=$WRT_VER"
             echo "WRT_INFO=${WRT_SOURCE%%/*}"
             echo "WRT_MARK=${GITHUB_REPOSITORY%%/*}"
             echo "WRT_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")"
@@ -289,7 +297,7 @@ jobs:
             for FILE in $(find ./bin/targets/ -type f -iname "*$WRT_TARGET*") ; do
               EXT=$(basename $FILE | cut -d '.' -f 2-)
               NAME=$(basename $FILE | cut -d '.' -f 1 | grep -io "\($WRT_TARGET\).*")
-              NEW_FILE="$NAME"-"$WRT_INFO"-"$WRT_BRANCH"-"$WRT_WIFI"-"$WRT_DATE"."$EXT"
+              NEW_FILE="$NAME"-v"$WRT_VER"-"$WRT_INFO"-"$WRT_BRANCH"-"$WRT_WIFI"-"$WRT_DATE"."$EXT"
               mv -f $FILE ./upload/$NEW_FILE
             done
 
@@ -314,7 +322,7 @@ jobs:
           command -v 7z >/dev/null 2>&1 || sudo apt-get install -y -qq p7zip-full
 
           # 所有发布文件打成一个 7z：AES-256 加密，文件名列表也加密（-mhe=on）
-          ARCHIVE="$WRT_CONFIG-$WRT_INFO-$WRT_BRANCH-$WRT_DATE.7z"
+          ARCHIVE="$WRT_CONFIG-v$WRT_VER-$WRT_INFO-$WRT_BRANCH-$WRT_DATE.7z"
           (cd ./upload/ && 7z a -t7z -mx=5 -mhe=on -p"$FW_ZIP_PASSWORD" "../$ARCHIVE" ./* > /dev/null)
           7z t -p"$FW_ZIP_PASSWORD" "./$ARCHIVE" > /dev/null
 
@@ -327,9 +335,12 @@ jobs:
       - name: Release Firmware
         uses: softprops/action-gh-release@master
         with:
-          tag_name: ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-${{env.WRT_DATE}}
+          tag_name: v${{env.WRT_VER}}-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-${{env.WRT_DATE}}
+          name: 固件 v${{env.WRT_VER}} · ${{env.WRT_CONFIG}} · ${{env.WRT_DATE}}
           files: ./wrt/upload/*.*
           body: |
+            固件版本：v${{env.WRT_VER}}（编译于 ${{env.WRT_DATE}}；路由器后台首页和管理页“固件”一栏显示的就是它）
+
             这是个平台固件包，内含多个设备！
             请注意选择你需要的设备固件！
             不要问，刷就完事了！
