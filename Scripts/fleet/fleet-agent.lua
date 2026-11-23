@@ -1,20 +1,34 @@
 #!/usr/bin/lua
--- fleet-agent：从下发服务拉取本机的节点配置，写进 PassWall 2。
+-- fleet-agent：从下发服务拉取本机的节点配置，写进 PassWall 2；同步时顺带上报 CPU 温度。
 --
 -- 开机运行一次，之后每 10 分钟由 cron 运行；调试时执行 fleet-agent --now（跳过随机等待）。
+-- fleet-agent --health 由 cron 每分钟运行：超温告警开始或解除时马上同步一次（不等 10 分钟），
+--   并在雅典娜屏幕上插播提示（断网、管理通道断开、到期、后台留言），把屏幕编号填成设备名最后 6 位。
 -- 只改名字以 fleet_ 开头的节点和分流规则；客户自己加的节点不动。
 -- 日志：logread -e fleet-agent
 --
 -- 依赖固件里已有的 lua、luci-lib-jsonc（luci.jsonc）、libuci-lua（uci）、uclient-fetch、tailscale。
 
 local M = {}
-M.VERSION = "1.0.0"
+M.VERSION = "1.1.0"
 M.PW = "passwall2"
 M.PREFIX = "fleet_"
 M.STATE_FILE = "/etc/fleet/state.json"
 M.LAST_FILE = "/etc/fleet/last.json"
 M.LOCK_DIR = "/var/lock/fleet-agent.lock"
 M.FLEET_TAG = "tag:fleet"
+-- 温度和屏幕：状态都放内存盘（/tmp），每分钟写也不伤闪存
+M.HEALTH_FILE = "/tmp/fleet/health.json"
+M.REPORTED_FILE = "/tmp/fleet/reported"
+M.HEALTH_LOCK_DIR = "/var/lock/fleet-health.lock"
+M.TEMP_ALERT_DEFAULT = 90
+M.TEMP_HYSTERESIS = 3
+M.SCREEN = "athena_led"
+-- 占位符不能以 - 开头：屏幕程序把它当命令行参数收，会被当成选项而启动失败
+M.SCREEN_PLACEHOLDER = "??????"
+-- 断网这类紧急提示每分钟插播 8 秒；到期、留言这类长期提示每 2 分钟插播 15 秒（屏幕程序每次插播都记一行日志）
+M.SCREEN_URGENT_SECONDS = 8
+M.SCREEN_NOTE_SECONDS = 15
 
 local STATUSES = { active = true, unchanged = true, pending = true, expired = true,
 	limited = true, disabled = true, no_nodes = true }
@@ -94,6 +108,14 @@ function M.clean_remark(s, fallback, limit)
 	return s
 end
 
+-- 屏幕留言：只留屏幕字库里有的字符（字母按大写显示），最多 24 个；不合格返回 nil
+function M.clean_notice(s)
+	if type(s) ~= "string" then return nil end
+	s = s:upper():gsub("%s+", " "):gsub("^ ", ""):gsub(" $", "")
+	if s == "" or #s > 24 or not s:match("^[A-Z0-9 %.:%+%-=/%*%%%(%)%?~_]+$") then return nil end
+	return s
+end
+
 local function interval_seconds(s)
 	local n, unit = s:match("^(%d+)([smh]?)$")
 	if not n then return nil end
@@ -168,6 +190,8 @@ function M.validate(r)
 	end
 	local refresh = tonumber(r.refresh_seconds)
 	out.refresh = (refresh and refresh >= 60 and refresh <= 86400) and math.floor(refresh) or 600
+	-- 留言只是屏幕上显示的字，不合格就当没有，不影响节点配置
+	out.notice = M.clean_notice(r.notice)
 	if st == "unchanged" then return out end
 
 	local oe = r.on_expire or "block"
@@ -407,7 +431,9 @@ M.env = {
 	cursor = function() return require("uci").cursor() end,
 	log = function(msg) os.execute("logger -t fleet-agent " .. shell_quote(msg)) end,
 	sleep = function(n) os.execute("sleep " .. tonumber(n)) end,
+	now = function() return os.time() end,
 	restart_passwall = function() os.execute("/etc/init.d/passwall2 restart >/dev/null 2>&1 &") end,
+	restart_screen = function() os.execute("/etc/init.d/athena_led restart >/dev/null 2>&1 &") end,
 }
 
 local function json()
@@ -458,7 +484,7 @@ function M.write_json(path, v)
 end
 
 local function read_conf(c)
-	local conf = { enabled = "1", server = "", port = "8080", timeout = "20" }
+	local conf = { enabled = "1", server = "", port = "8080", timeout = "20", temp_alert = "" }
 	c:foreach("fleet", "agent", function(s)
 		for k in pairs(conf) do
 			if s[k] ~= nil then conf[k] = s[k] end
@@ -467,10 +493,163 @@ local function read_conf(c)
 	return conf
 end
 
+-- 报给管理页“固件”一栏：优先用我们的固件版本号（/etc/fleet-firmware，如 1.1.0-26.11.23），
+-- 老固件没有这个文件就用 OpenWrt 源码版本
 local function firmware_version()
-	local v = (M.env.read("/etc/openwrt_version") or ""):gsub("%s+", "")
-	if not v:match("^[%w%._%+%-]+$") or #v > 40 then return "" end
-	return v
+	for _, path in ipairs({ "/etc/fleet-firmware", "/etc/openwrt_version" }) do
+		local v = (M.env.read(path) or ""):gsub("%s+", "")
+		if v ~= "" and #v <= 40 and v:match("^[%w%._%+%-]+$") then return v end
+	end
+	return ""
+end
+
+-- ------------------------------------------------------------ 温度
+-- 超温阈值（℃）：fleet.main.temp_alert，不合理的值按默认 90
+function M.temp_threshold(conf)
+	local v = tonumber(conf and conf.temp_alert)
+	if not v or v < 40 or v > 130 then return M.TEMP_ALERT_DEFAULT end
+	return math.floor(v)
+end
+
+local function read_celsius(path)
+	local raw = tonumber((M.env.read(path) or ""):match("%-?%d+"))
+	if not raw then return nil end
+	if math.abs(raw) > 1000 then raw = raw / 1000 end -- 一般是千分之一度
+	return raw
+end
+
+-- CPU 温度（℃，四舍五入）：按名字找 cpu 开头的传感器，找不到用 thermal_zone4；读不到返回 nil
+function M.cpu_temp()
+	local best
+	for i = 0, 15 do
+		local zone = "/sys/class/thermal/thermal_zone" .. i
+		local t = M.env.read(zone .. "/type")
+		if t and t:match("^%s*cpu") then
+			local c = read_celsius(zone .. "/temp")
+			if c and (not best or c > best) then best = c end
+		end
+	end
+	best = best or read_celsius("/sys/class/thermal/thermal_zone4/temp")
+	if not best or best < -40 or best > 150 then return nil end
+	return math.floor(best + 0.5)
+end
+
+-- 读一次温度，按 3℃ 滞回判断是否超温（和屏幕程序的告警一致）。
+-- 返回 { temp, hot, since, changed }，changed = 这次刚开始或刚解除
+function M.health_check(threshold, now)
+	local prev = M.read_json(M.HEALTH_FILE) or {}
+	local was_hot = prev.hot == true
+	local temp = M.cpu_temp()
+	local hot = was_hot
+	if temp then
+		if temp >= threshold then
+			hot = true
+		elseif temp <= threshold - M.TEMP_HYSTERESIS then
+			hot = false
+		end
+	end
+	local since = nil
+	if hot then since = (was_hot and tonumber(prev.since)) or now end
+	local cur = { temp = temp, hot = hot, since = since, threshold = threshold }
+	if prev.temp ~= temp or prev.hot ~= hot or prev.since ~= since or prev.threshold ~= threshold then
+		M.write_json(M.HEALTH_FILE, cur)
+	end
+	cur.changed = (hot ~= was_hot)
+	return cur
+end
+
+-- 最近一次成功报给下发服务的超温状态（重启后没有记录，按“没超温”算）
+function M.reported_hot()
+	return (M.env.read(M.REPORTED_FILE) or ""):match("^1") ~= nil
+end
+
+-- ------------------------------------------------------------ 屏幕
+local SCREEN_STATUS_TEXT = { expired = "EXPIRED", limited = "LIMIT", disabled = "STOPPED",
+	pending = "WAIT", no_nodes = "NO NODE" }
+
+-- 屏幕上要插播的提示（只用屏幕字库里有的字符）和它是否紧急；一切正常返回 nil
+-- 顺序：断网 > 管理通道断开 > 后台留言 > 账号状态
+function M.screen_message(ctx)
+	if ctx.wan_up == false then return "NET DOWN", true end
+	if ctx.ts_up == false then return "TS DOWN", true end
+	if ctx.notice then return ctx.notice, false end
+	local text = SCREEN_STATUS_TEXT[ctx.status or ""]
+	if text then return text, false end
+	return nil
+end
+
+-- 有没有默认路由（主路由表）：nil = 读不到，不判断
+function M.wan_up()
+	local routes = M.env.read("/proc/net/route")
+	if not routes then return nil end
+	for line in routes:gmatch("[^\n]+") do
+		local dest, flags, mask = line:match("^%S+%s+(%x+)%s+%x+%s+(%x+)%s+%S+%s+%S+%s+%S+%s+(%x+)")
+		if dest == "00000000" and mask == "00000000" and (tonumber(flags, 16) or 0) % 2 == 1 then
+			return true
+		end
+	end
+	return false
+end
+
+-- 屏幕编号：设备名（ts-autologin 设成“型号-12 位 MAC”）的最后 6 位，大写；拿不到设备名就用 br-lan 的 MAC
+function M.screen_id(ts)
+	local me = type(ts) == "table" and type(ts.Self) == "table" and ts.Self or {}
+	local hex
+	for _, name in ipairs({ me.HostName, me.DNSName }) do
+		if type(name) == "string" then
+			hex = name:lower():gsub("%.$", ""):match("^([^%.]*)"):match("%-(%x%x%x%x%x%x%x%x%x%x%x%x)$")
+			if hex then break end
+		end
+	end
+	if not hex then
+		local mac = (M.env.read("/sys/class/net/br-lan/address") or ""):lower():gsub("[^%x]", "")
+		if #mac == 12 then hex = mac end
+	end
+	return hex and hex:sub(7):upper() or nil
+end
+
+function M.screen_command(port, secs, text)
+	return string.format("printf 'show %d %%s\\n' %s | nc 127.0.0.1 %d >/dev/null 2>&1 &",
+		secs, M.shell_quote(text), port)
+end
+
+-- 雅典娜屏幕：编号和超温阈值跟着 fleet 设置走（只管我们写过出厂设置的屏幕），再插播提示
+function M.screen_tick(c, ctx)
+	local g = {}
+	c:foreach(M.SCREEN, "settings", function(sec)
+		if sec[".name"] == "general" then g = sec end
+	end)
+	if g.enabled ~= "1" or not g.fleet_defaults then return end
+
+	local changed = false
+	local id = M.screen_id(ctx.ts)
+	local text = g.custom_content
+	-- 只替换占位符或我们上次填的编号；在后台改成别的文字就不再动它
+	if id and text ~= id and (text == M.SCREEN_PLACEHOLDER or (g.fleet_id and text == g.fleet_id)) then
+		c:set(M.SCREEN, "general", "custom_content", id)
+		c:set(M.SCREEN, "general", "fleet_id", id)
+		changed = true
+	end
+	local threshold = tostring(ctx.threshold)
+	if ctx.threshold and g.temp_alert ~= threshold then
+		c:set(M.SCREEN, "general", "temp_alert", threshold)
+		changed = true
+	end
+	if changed then
+		c:commit(M.SCREEN)
+		M.env.restart_screen()
+		M.env.log("屏幕设置已更新（编号 " .. (id or "-") .. "，超温阈值 " .. threshold .. "℃）")
+		return -- 屏幕程序正在重启，这一分钟不插播
+	end
+
+	local msg, urgent = M.screen_message(ctx)
+	local port = tonumber(g.control_port)
+	if not msg or not port or port < 1 or port > 65535 then return end
+	if urgent then
+		M.env.run(M.screen_command(math.floor(port), M.SCREEN_URGENT_SECONDS, msg))
+	elseif math.floor(M.env.now() / 60) % 2 == 0 then
+		M.env.run(M.screen_command(math.floor(port), M.SCREEN_NOTE_SECONDS, msg))
+	end
 end
 
 -- 按回复改本机配置；返回 changed
@@ -551,6 +730,11 @@ function M.run(opts)
 	local host = M.is_ipv6(server) and ("[" .. server .. "]") or server
 	local url = string.format("http://%s:%d/v1/config?ver=%s&fw=%s&agent=%s", host, port, ver,
 		urlencode(firmware_version()), urlencode(M.VERSION))
+	-- 顺带上报 CPU 温度和是否超温（下发服务据此在管理页和面板用户备注里显示告警）
+	local health = M.health_check(M.temp_threshold(conf), M.env.now())
+	if health.temp then
+		url = url .. string.format("&temp=%d&hot=%d", health.temp, health.hot and 1 or 0)
+	end
 	local body = M.fetch(url, tonumber(conf.timeout) or 20)
 	if not body then
 		M.env.log("连不上下发服务或它暂时出错，保持现有配置")
@@ -562,58 +746,114 @@ function M.run(opts)
 		M.env.log("下发的配置不合格（" .. tostring(err) .. "），整份丢弃，保持现有配置")
 		return 0
 	end
+	if health.temp then
+		M.env.write(M.REPORTED_FILE, health.hot and "1" or "0")
+	end
 
 	local changed = M.handle(c, resp, state)
 	if changed then
 		M.env.restart_passwall()
 		M.env.log("配置已更新（" .. resp.status .. "），重启 PassWall 2")
 	end
+	local unchanged = resp.status == "unchanged"
 	local new_state = {
-		version = resp.status == "unchanged" and state.version or resp.version,
-		status = resp.status == "unchanged" and state.status or resp.status,
+		version = unchanged and state.version or resp.version,
+		status = unchanged and state.status or resp.status,
 		on_expire = resp.on_expire or state.on_expire,
 		snapshot = M.snapshot(c),
+		notice = unchanged and M.clean_notice(state.notice) or resp.notice,
 	}
 	if new_state.version ~= state.version or new_state.status ~= state.status
-		or new_state.snapshot ~= state.snapshot or new_state.on_expire ~= state.on_expire then
+		or new_state.snapshot ~= state.snapshot or new_state.on_expire ~= state.on_expire
+		or new_state.notice ~= state.notice then
 		M.write_json(M.STATE_FILE, new_state) -- 只在有变化时写闪存
 	end
 	return 0
 end
 
 -- 防止两份同时运行；锁目录里记 PID，进程已不在就当作残留锁清掉
-local function lock(retried)
-	if M.env.run("mkdir " .. M.LOCK_DIR .. " 2>/dev/null") == 0 then
-		M.env.write(M.LOCK_DIR .. "/pid", tostring(M.env.exec("echo $PPID"):match("%d+") or ""))
+local function lock(dir, retried)
+	if M.env.run("mkdir " .. dir .. " 2>/dev/null") == 0 then
+		M.env.write(dir .. "/pid", tostring(M.env.exec("echo $PPID"):match("%d+") or ""))
 		return true
 	end
-	local pid = (M.env.read(M.LOCK_DIR .. "/pid") or ""):match("%d+")
+	local pid = (M.env.read(dir .. "/pid") or ""):match("%d+")
 	if not retried and pid and not M.env.read("/proc/" .. pid .. "/stat") then
-		M.env.run("rm -rf " .. M.LOCK_DIR)
-		return lock(true)
+		M.env.run("rm -rf " .. dir)
+		return lock(dir, true)
 	end
 	return false
 end
 
-local function unlock()
-	M.env.run("rm -rf " .. M.LOCK_DIR)
+local function unlock(dir)
+	M.env.run("rm -rf " .. dir)
+end
+
+-- 同步一次（拿到锁才做）；返回 run 的结果或 nil
+local function sync(opts)
+	if not lock(M.LOCK_DIR) then return nil end
+	local ok, err = pcall(M.run, opts)
+	unlock(M.LOCK_DIR)
+	if not ok then
+		M.env.log("出错：" .. tostring(err))
+		return 1
+	end
+	return err or 0
+end
+
+-- 每分钟一次：超温状态变了且还没报给服务器就马上同步；再管屏幕
+function M.health_run()
+	local c = M.env.cursor()
+	local conf = read_conf(c)
+	local threshold = M.temp_threshold(conf)
+	local health = M.health_check(threshold, M.env.now())
+	if health.changed and health.temp then
+		if health.hot then
+			M.env.log("CPU 温度 " .. health.temp .. "℃，超过 " .. threshold .. "℃，告警")
+		else
+			M.env.log("CPU 温度降到 " .. health.temp .. "℃，超温告警解除")
+		end
+	end
+
+	local fleet_on = conf.enabled == "1"
+	if fleet_on and health.temp and health.hot ~= M.reported_hot() then
+		sync({ now = true })
+	end
+
+	local ok, v = pcall(json().parse, M.env.exec("tailscale status --json 2>/dev/null"))
+	local ts = ok and type(v) == "table" and v or nil
+	local ts_up -- 停用同步时不判断管理通道
+	if fleet_on then
+		ts_up = ts ~= nil and ts.BackendState == "Running"
+			and not (type(ts.Self) == "table" and ts.Self.Online == false)
+	end
+	local state = M.read_json(M.STATE_FILE) or {}
+	M.screen_tick(M.env.cursor(), {
+		ts = ts, ts_up = ts_up, wan_up = M.wan_up(), threshold = threshold,
+		status = state.status, notice = M.clean_notice(state.notice),
+	})
+	return 0
 end
 
 function M.main(argv)
 	local opts = {}
 	for _, a in ipairs(argv or {}) do
 		if a == "--now" then opts.now = true end
+		if a == "--health" then opts.health = true end
 		if a == "--version" then print(M.VERSION) return 0 end
 	end
-	M.env.run("mkdir -p /etc/fleet")
-	if not lock() then return 0 end
-	local ok, err = pcall(M.run, opts)
-	unlock()
-	if not ok then
-		M.env.log("出错：" .. tostring(err))
-		return 1
+	M.env.run("mkdir -p /etc/fleet /tmp/fleet")
+	if opts.health then
+		if not lock(M.HEALTH_LOCK_DIR) then return 0 end
+		local ok, err = pcall(M.health_run)
+		unlock(M.HEALTH_LOCK_DIR)
+		if not ok then
+			M.env.log("温度/屏幕检查出错：" .. tostring(err))
+			return 1
+		end
+		return err or 0
 	end
-	return err or 0
+	return sync(opts) or 0
 end
 
 if not FLEET_AGENT_LIBRARY then

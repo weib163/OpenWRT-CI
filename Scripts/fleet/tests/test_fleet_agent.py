@@ -107,6 +107,7 @@ class AgentHarness:
         self.logs = []
         self.commands = []
         self.restarts = 0
+        self.screen_restarts = 0
         self.exec_map = {}
         env = self.M.env
         env.exec = self._exec
@@ -117,6 +118,9 @@ class AgentHarness:
         env.log = lambda msg: self.logs.append(msg)
         env.sleep = lambda n: None
         env.restart_passwall = self._restart
+        env.restart_screen = self._restart_screen
+        self.now = 1800000000  # 整分钟、偶数分钟
+        env.now = lambda: self.now
         self.cursor = self.new_cursor(self.to_lua({"passwall2": copy.deepcopy(DEFAULT_PW),
                                                    "fleet": [{".name": "main", ".type": "agent", "enabled": "1",
                                                               "server": "", "port": "8080"}]}))
@@ -156,6 +160,9 @@ class AgentHarness:
 
     def _restart(self):
         self.restarts += 1
+
+    def _restart_screen(self):
+        self.screen_restarts += 1
 
     # ---- 便捷方法
     def sections(self, stype=None):
@@ -351,7 +358,7 @@ class RunTests(unittest.TestCase):
         self.serve(resp)
         self.assertEqual(self.h.M.main(self.h.lua.table_from(["--now"])), 0)
         fetch = [c for c in self.h.commands if "uclient-fetch" in c][0]
-        self.assertIn("'http://100.64.0.9:8080/v1/config?ver=&fw=r28000-abcdef&agent=1.0.0'", fetch)
+        self.assertIn("'http://100.64.0.9:8080/v1/config?ver=&fw=r28000-abcdef&agent=1.1.0'", fetch)
         self.assertEqual(self.h.restarts, 1)
         state = json.loads(self.h.files["/etc/fleet/state.json"])
         self.assertEqual((state["version"], state["status"]), (resp["version"], "active"))
@@ -391,6 +398,15 @@ class RunTests(unittest.TestCase):
         self.serve(server_response())
         self.h.M.main(self.h.lua.table_from(["--now"]))
         self.assertFalse([c for c in self.h.commands if "uclient-fetch" in c])
+
+    def test_reports_firmware_version(self):
+        self.h.files["/etc/fleet-firmware"] = "1.1.0-26.11.23\n"
+        self.serve(server_response())
+        self.h.M.main(self.h.lua.table_from(["--now"]))
+        self.assertIn("&fw=1.1.0-26.11.23&", [c for c in self.h.commands if "uclient-fetch" in c][-1])
+        self.h.files["/etc/fleet-firmware"] = "bad version!\n"  # 不合格就退回 OpenWrt 源码版本
+        self.h.M.main(self.h.lua.table_from(["--now"]))
+        self.assertIn("&fw=r28000-abcdef&", [c for c in self.h.commands if "uclient-fetch" in c][-1])
 
     def test_url_quoting_is_safe(self):
         q = self.h.M.shell_quote("a'b")
@@ -496,3 +512,286 @@ class EndToEndTests(unittest.TestCase):
         self.assertNotIn("fleet_haaaaaaaa11", nodes)
         self.assertEqual(nodes["fleet_shunt"]["default_node"], "_blackhole")
         self.assertIn("fleet_direct", self.h.sections("shunt_rules"))
+
+
+# ---------------------------------------------------------------- 温度、超温上报、屏幕
+THERMAL = "/sys/class/thermal/thermal_zone%d/%s"
+ROUTE_HEADER = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+ROUTE_LAN = "br-lan\t000AA8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n"
+ROUTE_UP = ROUTE_HEADER + "wan\t00000000\t0100A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n" + ROUTE_LAN
+ROUTE_DOWN = ROUTE_HEADER + ROUTE_LAN
+SCREEN = {".name": "general", ".type": "settings", "enabled": "1", "fleet_defaults": "1",
+          "custom_content": "??????", "temp_alert": "90", "control_port": "8377"}
+
+
+class HealthTests(unittest.TestCase):
+    STATUS = copy.deepcopy(RunTests.STATUS)
+    STATUS["Self"]["HostName"] = "re-cs-02-1c2ab34d5e6f"
+    STATUS["Self"]["Online"] = True
+
+    def setUp(self):
+        self.h = AgentHarness()
+        self.h.files["/etc/openwrt_version"] = "r28000\n"
+        self.h.files["/proc/net/route"] = ROUTE_UP
+        self.h.files[THERMAL % (0, "type")] = "nss-top-thermal\n"
+        self.h.files[THERMAL % (0, "temp")] = "61000\n"
+        self.h.files[THERMAL % (4, "type")] = "cpu-thermal\n"
+        self.set_temp(72.5)
+        self.h.exec_map["tailscale status --json"] = json.dumps(self.STATUS)
+        self.h.exec_map["echo $PPID"] = "77\n"
+        c = self.h.cursor
+        self.h.cursor = self.h.new_cursor(self.h.to_lua({
+            "passwall2": self.h.to_py(c.committed["passwall2"]),
+            "fleet": self.h.to_py(c.committed["fleet"]),
+            "athena_led": [dict(SCREEN)],
+        }))
+        self.serve(server_response())
+
+    def set_temp(self, celsius):
+        self.h.files[THERMAL % (4, "temp")] = "%d\n" % int(celsius * 1000)
+
+    def serve(self, body):
+        self.body = body
+        self.h.exec_map["uclient-fetch"] = lambda cmd: json.dumps(self.body) + "__FLEET_RC=0\n"
+
+    def fetches(self):
+        return [c for c in self.h.commands if "uclient-fetch" in c]
+
+    def screen_cmds(self):
+        return [c for c in self.h.commands if "nc 127.0.0.1" in c]
+
+    def health(self):
+        self.assertEqual(self.h.M.main(self.h.lua.table_from(["--health"])), 0)
+
+    def screen_conf(self):
+        return [s for s in self.h.to_py(self.h.cursor.committed["athena_led"]) if s[".name"] == "general"][0]
+
+    def test_cpu_temp_uses_cpu_zone_and_rounds(self):
+        self.assertEqual(self.h.M.cpu_temp(), 73)
+        del self.h.files[THERMAL % (4, "type")]  # 没有叫 cpu 的传感器：退回 thermal_zone4
+        self.assertEqual(self.h.M.cpu_temp(), 73)
+        del self.h.files[THERMAL % (4, "temp")]
+        self.assertIsNone(self.h.M.cpu_temp())
+
+    def test_hysteresis(self):
+        M = self.h.M
+        self.set_temp(89)
+        r = M.health_check(90, 1000)
+        self.assertEqual((r.temp, r.hot, r.changed), (89, False, False))
+        self.set_temp(90)
+        r = M.health_check(90, 1060)
+        self.assertEqual((r.hot, r.since, r.changed), (True, 1060, True))
+        self.set_temp(88)  # 只降了 2℃：还算超温，开始时间不变
+        r = M.health_check(90, 1120)
+        self.assertEqual((r.hot, r.since, r.changed), (True, 1060, False))
+        self.set_temp(87)
+        r = M.health_check(90, 1180)
+        self.assertEqual((r.hot, r.since, r.changed), (False, None, True))
+
+    def test_sync_reports_temperature(self):
+        self.h.M.main(self.h.lua.table_from(["--now"]))
+        self.assertIn("&temp=73&hot=0'", self.fetches()[-1])
+        self.assertEqual(self.h.files[self.h.M.REPORTED_FILE], "0")
+
+    def test_overheat_is_reported_at_once_and_only_once(self):
+        self.h.M.main(self.h.lua.table_from(["--now"]))
+        n = len(self.fetches())
+        self.set_temp(95)
+        self.health()
+        self.assertEqual(len(self.fetches()), n + 1)
+        self.assertIn("&temp=95&hot=1'", self.fetches()[-1])
+        self.assertTrue(any("超过 90℃" in m for m in self.h.logs))
+        self.health()  # 已经报过：不再同步
+        self.assertEqual(len(self.fetches()), n + 1)
+        self.set_temp(86)
+        self.health()
+        self.assertIn("&temp=86&hot=0'", self.fetches()[-1])
+        self.assertTrue(any("解除" in m for m in self.h.logs))
+
+    def test_unreported_alarm_retries_next_minute(self):
+        self.set_temp(95)
+        self.h.exec_map["uclient-fetch"] = "__FLEET_RC=4\n"  # 下发服务暂时连不上
+        self.health()
+        self.health()
+        self.assertEqual(len(self.fetches()), 2)
+        self.serve(server_response())
+        self.health()
+        self.assertEqual(self.h.files[self.h.M.REPORTED_FILE], "1")
+        self.health()
+        self.assertEqual(len(self.fetches()), 3)
+
+    def test_threshold_from_fleet_config(self):
+        c = self.h.cursor
+        c.set(c, "fleet", "main", "temp_alert", "75")
+        c.commit(c, "fleet")
+        self.set_temp(80)
+        self.health()
+        self.assertIn("&hot=1'", self.fetches()[-1])
+        self.assertEqual(self.screen_conf()["temp_alert"], "75")  # 屏幕的闪烁告警也跟着改
+        for bad in ("abc", "5", "500"):
+            self.assertEqual(self.h.M.temp_threshold(self.h.lua.table_from({"temp_alert": bad})), 90)
+
+    def test_fleet_disabled_still_runs_screen_but_never_syncs(self):
+        c = self.h.cursor
+        c.set(c, "fleet", "main", "enabled", "0")
+        c.commit(c, "fleet")
+        self.set_temp(99)
+        self.health()
+        self.assertEqual(self.fetches(), [])
+        self.assertEqual(self.screen_conf()["custom_content"], "4D5E6F")
+
+    def test_screen_id_from_device_name(self):
+        self.health()
+        conf = self.screen_conf()
+        self.assertEqual((conf["custom_content"], conf["fleet_id"]), ("4D5E6F", "4D5E6F"))
+        self.assertEqual(self.h.screen_restarts, 1)
+        self.health()
+        self.assertEqual(self.h.screen_restarts, 1)
+
+    def test_screen_id_falls_back_to_lan_mac(self):
+        self.h.exec_map["tailscale status --json"] = json.dumps({"BackendState": "Running", "Self": {"HostName": "OpenWrt"}})
+        self.h.files["/sys/class/net/br-lan/address"] = "1C:2A:B3:00:00:0A\n"
+        self.health()
+        self.assertEqual(self.screen_conf()["custom_content"], "00000A")
+
+    def test_screen_text_set_by_admin_is_kept(self):
+        c = self.h.cursor
+        c.set(c, "athena_led", "general", "custom_content", "HELLO")
+        c.commit(c, "athena_led")
+        self.health()
+        self.assertEqual(self.screen_conf()["custom_content"], "HELLO")
+        self.assertEqual(self.h.screen_restarts, 0)
+
+    def test_screen_not_managed_is_left_alone(self):
+        c = self.h.cursor
+        c.delete(c, "athena_led", "general", "fleet_defaults")
+        c.commit(c, "athena_led")
+        self.set_temp(95)
+        self.health()
+        self.assertEqual(self.screen_conf()["custom_content"], "??????")
+        self.assertEqual(self.screen_cmds(), [])
+
+    def test_screen_messages(self):
+        self.health()  # 第一次：填编号、重启屏幕程序，这一分钟不插播
+        self.assertEqual(self.screen_cmds(), [])
+        self.health()  # 一切正常：不插播
+        self.assertEqual(self.screen_cmds(), [])
+
+        cases = [
+            ({"/proc/net/route": ROUTE_DOWN}, None, "NET DOWN"),
+            ({}, {"BackendState": "NeedsLogin"}, "TS DOWN"),
+            ({}, dict(self.STATUS, Self=dict(self.STATUS["Self"], Online=False)), "TS DOWN"),
+        ]
+        for files, ts, text in cases:
+            self.h.files.update(files)
+            if ts is not None:
+                self.h.exec_map["tailscale status --json"] = json.dumps(ts)
+            for minute in (0, 1):  # 紧急提示每分钟都插播 8 秒
+                self.h.now = 1800000000 + minute * 60
+                n = len(self.screen_cmds())
+                self.health()
+                self.assertEqual(len(self.screen_cmds()), n + 1)
+                self.assertIn("'show 8 %s\\n' '" + text + "'", self.screen_cmds()[-1])
+            self.h.files["/proc/net/route"] = ROUTE_UP
+            self.h.exec_map["tailscale status --json"] = json.dumps(self.STATUS)
+
+        for status, text in (("expired", "EXPIRED"), ("limited", "LIMIT"), ("disabled", "STOPPED"),
+                             ("pending", "WAIT"), ("no_nodes", "NO NODE")):
+            self.h.files["/etc/fleet/state.json"] = json.dumps({"status": status})
+            self.h.now = 1800000000
+            self.health()
+            self.assertIn("'show 15 %s\\n' '" + text + "'", self.screen_cmds()[-1])
+            n = len(self.screen_cmds())
+            self.h.now = 1800000060  # 长期提示隔一分钟才插播一次
+            self.health()
+            self.assertEqual(len(self.screen_cmds()), n)
+        # 后台留言比账号状态优先
+        self.h.now = 1800000000
+        self.h.files["/etc/fleet/state.json"] = json.dumps({"status": "expired", "notice": "PAY BY 12-01"})
+        self.health()
+        self.assertIn("'PAY BY 12-01'", self.screen_cmds()[-1])
+
+    def test_screen_command_is_quoted(self):
+        cmd = self.h.M.screen_command(8377, 8, "A'B")
+        self.assertEqual(cmd, "printf 'show 8 %s\\n' 'A'\\''B' | nc 127.0.0.1 8377 >/dev/null 2>&1 &")
+
+    def test_wan_up(self):
+        self.assertTrue(self.h.M.wan_up())
+        self.h.files["/proc/net/route"] = ROUTE_DOWN
+        self.assertFalse(self.h.M.wan_up())
+        del self.h.files["/proc/net/route"]
+        self.assertIsNone(self.h.M.wan_up())
+
+
+class NoticeTests(unittest.TestCase):
+    def setUp(self):
+        self.h = AgentHarness()
+
+    def test_clean_notice(self):
+        M = self.h.M
+        self.assertEqual(M.clean_notice("  pay   by 12-01 "), "PAY BY 12-01")
+        self.assertEqual(M.clean_notice("CALL 13800000000"), "CALL 13800000000")
+        for bad in ("续费", "a" * 25, "x;rm -rf /", "a'b", "", "   ", None, 5):
+            self.assertIsNone(M.clean_notice(bad), repr(bad))
+
+    def test_notice_saved_and_kept_when_unchanged(self):
+        h = self.h
+        h.files["/etc/openwrt_version"] = "r28000\n"
+        h.exec_map["tailscale status --json"] = json.dumps(RunTests.STATUS)
+        h.exec_map["echo $PPID"] = "5\n"
+        resp = server_response()
+        resp["notice"] = "pay by 12-01"
+        h.exec_map["uclient-fetch"] = json.dumps(resp) + "__FLEET_RC=0\n"
+        h.M.main(h.lua.table_from(["--now"]))
+        self.assertEqual(json.loads(h.files["/etc/fleet/state.json"])["notice"], "PAY BY 12-01")
+        h.exec_map["uclient-fetch"] = json.dumps({"schema": 1, "status": "unchanged", "version": resp["version"]}) + "__FLEET_RC=0\n"
+        h.M.main(h.lua.table_from(["--now"]))
+        self.assertEqual(json.loads(h.files["/etc/fleet/state.json"])["notice"], "PAY BY 12-01")
+        # 新配置里没有留言：清掉
+        h.exec_map["uclient-fetch"] = json.dumps(server_response()) + "__FLEET_RC=0\n"
+        h.M.main(h.lua.table_from(["--now"]))
+        self.assertNotIn("notice", json.loads(h.files["/etc/fleet/state.json"]))
+
+    def test_bad_notice_does_not_block_config(self):
+        resp = server_response()
+        resp["notice"] = "续费"
+        cfg, err = self.h.validate(resp)
+        self.assertIsNotNone(cfg, err)
+        self.assertIsNone(self.h.to_py(cfg).get("notice"))
+
+
+class EndToEndHealthTests(EndToEndTests):
+    """真实 fleet-server + 路由器脚本：超温告警、面板备注、屏幕留言。"""
+
+    test_lifecycle = None  # 父类的完整生命周期这里不重复跑
+
+    def test_overheat_and_notice(self):
+        t = self.t
+        self.panel.users[self.NAME] = t.make_user(self.NAME)
+        self.panel.configs[self.NAME] = [t.reality_cfg("aaaaaaaa-1111-4111-8111-111111111111")]
+        self.h.files[THERMAL % (4, "type")] = "cpu-thermal\n"
+        self.h.files[THERMAL % (4, "temp")] = "71000\n"
+        self.cycle()
+        node = self.fleet.store.get("node-1")
+        self.assertEqual((node["username"], node["temp"], node["hot"]), (self.NAME, 71, 0))
+
+        # 超温：每分钟的检查马上上报，管理页数据和面板备注都更新
+        self.h.files[THERMAL % (4, "temp")] = "95000\n"
+        self.assertEqual(self.h.M.main(self.h.lua.table_from(["--health"])), 0)
+        self.assertEqual(self.fleet.store.get("node-1")["hot"], 1)
+        self.assertTrue(self.fleet.notes.flush())
+        self.assertEqual(self.panel.users[self.NAME]["description"], "⚠ 路由器温度过高：95℃\n张三 13800000000")
+
+        # 后台写留言：下一轮同步路由器就拿到
+        self.fleet.store.set_notice("node-1", "PAY BY 12-01")
+        self.cycle()
+        self.assertEqual(json.loads(self.h.files["/etc/fleet/state.json"])["notice"], "PAY BY 12-01")
+
+        # 降温：马上报“恢复”，备注那一行去掉
+        self.h.files[THERMAL % (4, "temp")] = "80000\n"
+        self.h.M.main(self.h.lua.table_from(["--health"]))
+        self.assertEqual(self.fleet.store.get("node-1")["hot"], 0)
+        self.assertTrue(self.fleet.notes.flush())
+        self.assertEqual(self.panel.users[self.NAME]["description"], "张三 13800000000")
+        kinds = [e["kind"] for e in self.fleet.store.events(10, ["overheat", "overheat_clear"])]
+        self.assertEqual(kinds, ["overheat_clear", "overheat"])
