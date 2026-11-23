@@ -399,3 +399,100 @@ class RunTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EndToEndTests(unittest.TestCase):
+    """真实的 fleet-server（HTTP）+ 假 Remnawave + 路由器脚本，走完整个生命周期。"""
+
+    NAME = "re-cs-02-1c2ab34d5e6f"
+
+    def setUp(self):
+        import threading
+        import urllib.error
+        import urllib.request
+        sys.path.insert(0, os.path.join(SERVER_DIR, "tests"))
+        import test_fleet_server as t
+        self.t = t
+        self.panel = t.FakePanel()
+        cfg = fs.Config.from_env({"REMNAWAVE_URL": self.panel.url, "REMNAWAVE_TOKEN": "test-token", "FLEET_DB": ":memory:",
+                                  "FLEET_CACHE_TTL": "0", "FLEET_DIRECT": "hs.example.com", "FLEET_RATE_PER_MINUTE": "1000"})
+        cfg.port = 0
+        whois = fs.WhoisCache(cfg, lambda c, ip: t.whois_router("node-1", self.NAME), ttl=0)
+        self.fleet = fs.Fleet(cfg, fs.Store(":memory:"), fs.RemnawaveClient(cfg), whois)
+        self.server = fs.make_server(cfg, self.fleet, "127.0.0.1")
+        port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+        self.h = AgentHarness()
+        self.h.files["/etc/openwrt_version"] = "r28000\n"
+        status = copy.deepcopy(RunTests.STATUS)
+        self.h.exec_map["tailscale status --json"] = json.dumps(status)
+        self.h.exec_map["echo $PPID"] = "99\n"
+        c = self.h.cursor
+        c.set(c, "fleet", "main", "server", "127.0.0.1")
+        c.set(c, "fleet", "main", "port", str(port))
+        c.commit(c, "fleet")
+
+        def fetch(cmd):
+            url = cmd.split("'")[1]
+            try:
+                with urllib.request.urlopen(url, timeout=5) as r:
+                    return r.read().decode() + "__FLEET_RC=0\n"
+            except urllib.error.HTTPError:
+                return "__FLEET_RC=8\n"  # uclient-fetch 遇到非 200 时退出码非 0
+        self.h.exec_map["uclient-fetch"] = fetch
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.panel.close()
+
+    def cycle(self):
+        self.assertEqual(self.h.M.main(self.h.lua.table_from(["--now"])), 0)
+
+    def test_lifecycle(self):
+        t = self.t
+        # 1. 新路由器：面板里还没有用户 → 待开通，PassWall 2 保持关闭
+        self.cycle()
+        self.assertEqual(self.h.global_opts()["enabled"], "0")
+        self.assertEqual(self.fleet.store.get("node-1")["last_status"], "pending")
+        # 2. 面板里建好同名用户 → 自动绑定，写入节点并打开
+        self.panel.users[self.NAME] = t.make_user(self.NAME)
+        self.panel.configs[self.NAME] = [t.reality_cfg("aaaaaaaa-1111-4111-8111-111111111111"),
+                                         t.ws_cfg("bbbbbbbb-2222-4222-8222-222222222222")]
+        self.cycle()
+        nodes = self.h.sections("nodes")
+        self.assertIn("fleet_haaaaaaaa11", nodes)
+        self.assertEqual((self.h.global_opts()["node"], self.h.global_opts()["enabled"]), ("fleet_shunt", "1"))
+        restarts = self.h.restarts
+        # 3. 没变化 → 不重启
+        self.cycle()
+        self.assertEqual(self.h.restarts, restarts)
+        # 4. 面板里换了地址 → 下一轮更新
+        self.panel.configs[self.NAME][0]["address"] = "203.0.113.99"
+        self.cycle()
+        self.assertEqual(self.h.sections("nodes")["fleet_haaaaaaaa11"]["address"], "203.0.113.99")
+        # 5. 到期（默认 block）→ 节点保留，PassWall 2 开着；设了 EXPIRE_DIRECT → 关掉
+        self.panel.users[self.NAME]["status"] = "EXPIRED"
+        self.cycle()
+        self.assertIn("fleet_haaaaaaaa11", self.h.sections("nodes"))
+        self.assertEqual(self.h.global_opts()["enabled"], "1")
+        self.panel.users[self.NAME]["tag"] = "EXPIRE_DIRECT"
+        self.cycle()
+        self.assertEqual(self.h.global_opts()["enabled"], "0")
+        # 6. 续费 → 恢复
+        self.panel.users[self.NAME].update(status="ACTIVE", tag=None)
+        self.cycle()
+        self.assertEqual(self.h.global_opts()["enabled"], "1")
+        # 7. 面板暂时连不上 → 保持现状
+        before = self.h.sections()
+        self.panel.down = True
+        self.cycle()
+        self.assertEqual(self.h.sections(), before)
+        self.panel.down = False
+        # 8. 停用 → 节点和 UUID 删掉，翻墙流量丢弃，管理通道直连规则还在
+        self.panel.users[self.NAME]["status"] = "DISABLED"
+        self.cycle()
+        nodes = self.h.sections("nodes")
+        self.assertNotIn("fleet_haaaaaaaa11", nodes)
+        self.assertEqual(nodes["fleet_shunt"]["default_node"], "_blackhole")
+        self.assertIn("fleet_direct", self.h.sections("shunt_rules"))

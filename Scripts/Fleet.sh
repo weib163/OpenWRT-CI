@@ -35,7 +35,7 @@ cat > "$FILES_DIR/etc/uci-defaults/97-fleet-agent" <<'EOF'
 #!/bin/sh
 /etc/init.d/fleet-agent enable
 touch /etc/crontabs/root
-grep -q '/usr/bin/fleet-agent' /etc/crontabs/root || echo '*/10 * * * * /usr/bin/fleet-agent' >> /etc/crontabs/root
+grep -q '/usr/bin/fleet-agent' /etc/crontabs/root || echo '*/10 * * * * PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/fleet-agent' >> /etc/crontabs/root
 /etc/init.d/cron enable
 exit 0
 EOF
