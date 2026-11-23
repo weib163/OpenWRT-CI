@@ -210,7 +210,7 @@ jobs:
           make defconfig -j$(nproc) && make clean -j$(nproc)
 
           echo "关键设备和插件（=y 表示会编进固件）："
-          grep -E '^CONFIG_(TARGET_DEVICE_.*jdcloud.*|PACKAGE_(xray-core|sing-box|tailscale|ttyd|kmod-tun|luci-app-passwall2|luci-app-athena-led|luci-app-tailscale-community))=' .config || true
+          grep -E '^CONFIG_(TARGET_DEVICE_.*jdcloud.*|PACKAGE_(xray-core|sing-box|tailscale|ttyd|kmod-tun|luci-app-passwall2|athena-led|luci-app-athena-led|luci-app-tailscale-community))=' .config || true
 
       - name: Prepare Rust Toolchain
         if: ${{ !inputs.WRT_TEST }}

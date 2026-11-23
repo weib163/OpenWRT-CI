@@ -92,6 +92,58 @@ UPDATE_PACKAGE "mt5700m" "LianXia233/luci-app-mt5700m" "main"
 UPDATE_PACKAGE "netmonitor" "LianXia233/luci-app-netmonitor" "main"
 UPDATE_PACKAGE "qmodem-generic" "LianXia233/luci-app-qmodem-generic" "main"
 
+#雅典娜（RE-CS-02）前面板屏幕：源码自带的旧驱动换成增强版（超温闪烁告警、本机控制接口、夜间调暗）
+#tag、提交和预编译程序的哈希都钉死：上游改动任何一样都会在这里直接停下，不会悄悄换掉
+ATHENA_LED_REPO="unraveloop/JDC-AX6600-Athena-LED-Controller"
+ATHENA_LED_TAG="v2.4.0"
+ATHENA_LED_COMMIT="a0eae21dc1119a56aaf8633c610af03a92f7493c"
+ATHENA_LED_HASH="243560a5e6bb52e5a493f7efa528771a6ab26e325a69b6e1d9d89647eaac5f3f"
+
+UPDATE_ATHENA_LED() {
+	local DIR="./package/athena-led-enhanced"
+	local DEVICE_MK="./target/linux/qualcommax/image/ipq60xx.mk"
+
+	echo " "
+	# 旧驱动（同名的 luci-app-athena-led）和它的 /etc/config/athena_led 会和新包冲突，先删掉
+	rm -rf ./package/emortal/luci-app-athena-led "$DIR"
+	find ./feeds/luci/ ./feeds/packages/ -maxdepth 3 -type d \
+		\( -name "luci-app-athena-led" -o -name "athena-led" \) -prune -exec rm -rf {} + 2>/dev/null
+
+	git clone --depth=1 --single-branch --branch "$ATHENA_LED_TAG" "https://github.com/$ATHENA_LED_REPO.git" "$DIR" || return 1
+	if [ "$(git -C "$DIR" rev-parse HEAD)" != "$ATHENA_LED_COMMIT" ]; then
+		echo "$ATHENA_LED_TAG 指向的提交变了（期望 $ATHENA_LED_COMMIT）"
+		return 1
+	fi
+
+	# 上游的 Makefile 不校验下载的程序（PKG_HASH:=skip），这里填上 v2.4.0 发布包的 sha256
+	sed -i "s/^PKG_HASH:=skip$/PKG_HASH:=$ATHENA_LED_HASH/" "$DIR/athena-led/Makefile"
+	grep -qx "PKG_HASH:=$ATHENA_LED_HASH" "$DIR/athena-led/Makefile" || return 1
+
+	# 界面包直接调用 po2lmo，完整编译时它不在 PATH 里，中文会被悄悄跳过：改用 luci-base 编出来的那份
+	local LUCI_MK="$DIR/luci-app-athena-led/Makefile"
+	# shellcheck disable=SC2016 # $(...) 是 Makefile 里的写法，要原样写进去
+	sed -i 's#&& po2lmo #\&\& $(STAGING_DIR_HOSTPKG)/bin/po2lmo #' "$LUCI_MK"
+	sed -i 's#^PKG_LICENSE_FILES:=LICENSE$#&\nPKG_BUILD_DEPENDS:=luci-base/host#' "$LUCI_MK"
+	# shellcheck disable=SC2016
+	grep -qF '$(STAGING_DIR_HOSTPKG)/bin/po2lmo ./po/zh_Hans/athena_led.po' "$LUCI_MK" || return 1
+	grep -qx 'PKG_BUILD_DEPENDS:=luci-base/host' "$LUCI_MK" || return 1
+
+	# 增强版把中文翻译直接打在界面包里，没有单独的 luci-i18n-athena-led-zh-cn 包，从设备默认包里去掉
+	if [ -f "$DEVICE_MK" ]; then
+		sed -i 's/ luci-i18n-athena-led-zh-cn//g' "$DEVICE_MK"
+		if grep -q 'luci-i18n-athena-led-zh-cn' "$DEVICE_MK"; then
+			echo "$DEVICE_MK 里还有 luci-i18n-athena-led-zh-cn"
+			return 1
+		fi
+	fi
+	echo "athena-led $ATHENA_LED_TAG is ready!"
+}
+
+if ! UPDATE_ATHENA_LED; then
+	echo "::error::雅典娜屏幕驱动准备失败，停止编译"
+	exit 1
+fi
+
 #更新软件包版本
 UPDATE_VERSION() {
 	local PKG_NAME=$1

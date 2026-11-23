@@ -1,8 +1,10 @@
 #!/bin/bash
 # 把集群管理相关的东西写进固件：
-#   1. fleet-agent 路由器同步脚本（开机跑一次，之后每 10 分钟一次）
-#   2. 网页终端 ttyd 改为所有接口监听，Tailscale 内网才能打开（外网仍被防火墙挡住）
-#   3. 可选：设置 root 密码（GitHub Secret ROOT_PW_HASH，只在密码为空时生效）
+#   1. fleet-agent 路由器同步脚本（开机跑一次，之后每 10 分钟一次；同步时顺带上报 CPU 温度）
+#   2. fleet-agent --health 每分钟一次：超温告警开始/解除时马上上报，屏幕上插播提示（断网、到期、留言等）
+#   3. 雅典娜前面板屏幕的出厂设置（时间、路由器编号、温度轮播，超温闪烁告警，夜间调暗）
+#   4. 网页终端 ttyd 改为所有接口监听，Tailscale 内网才能打开（外网仍被防火墙挡住）
+#   5. 可选：设置 root 密码（GitHub Secret ROOT_PW_HASH，只在密码为空时生效）
 # 在 ./wrt/ 目录下运行。
 set -e
 
@@ -11,6 +13,8 @@ SRC="$GITHUB_WORKSPACE/Scripts/fleet"
 mkdir -p "$FILES_DIR/usr/bin" "$FILES_DIR/etc/config" "$FILES_DIR/etc/init.d" "$FILES_DIR/etc/uci-defaults"
 
 install -m 755 "$SRC/fleet-agent.lua" "$FILES_DIR/usr/bin/fleet-agent"
+# 屏幕出厂设置：只有装了屏幕驱动的雅典娜会用到，其他机型开机时自己跳过
+install -m 755 "$SRC/screen-defaults.sh" "$FILES_DIR/etc/uci-defaults/94-fleet-screen"
 
 cat > "$FILES_DIR/etc/config/fleet" <<'EOF'
 config agent 'main'
@@ -19,6 +23,8 @@ config agent 'main'
 	option server ''
 	option port '8080'
 	option timeout '20'
+	# CPU 超过这个温度（℃）算超温：屏幕闪烁告警、马上报给下发服务；降到低 3℃ 以下解除
+	option temp_alert '90'
 EOF
 
 cat > "$FILES_DIR/etc/init.d/fleet-agent" <<'EOF'
@@ -35,7 +41,8 @@ cat > "$FILES_DIR/etc/uci-defaults/97-fleet-agent" <<'EOF'
 #!/bin/sh
 /etc/init.d/fleet-agent enable
 touch /etc/crontabs/root
-grep -q '/usr/bin/fleet-agent' /etc/crontabs/root || echo '*/10 * * * * PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/fleet-agent' >> /etc/crontabs/root
+grep -q '/usr/bin/fleet-agent$' /etc/crontabs/root || echo '*/10 * * * * PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/fleet-agent' >> /etc/crontabs/root
+grep -q '/usr/bin/fleet-agent --health' /etc/crontabs/root || echo '* * * * * PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/fleet-agent --health' >> /etc/crontabs/root
 /etc/init.d/cron enable
 exit 0
 EOF
