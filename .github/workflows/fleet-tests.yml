@@ -23,7 +23,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Fleet agent unit tests
         run: |
@@ -35,6 +35,7 @@ jobs:
           bash -n Scripts/Fleet.sh
           bash -n Scripts/Tailscale.sh
           bash -n Scripts/fleet/passwall2-contract.sh
+          sh -n Scripts/fleet/screen-defaults.sh
 
       - name: PassWall 2 fields (pinned version)
         run: |
