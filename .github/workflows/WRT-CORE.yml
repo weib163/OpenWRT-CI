@@ -387,6 +387,8 @@ jobs:
           tag_name: v${{env.WRT_VER}}-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-${{env.WRT_DATE}}
           name: 固件 v${{env.WRT_VER}} · ${{env.WRT_CONFIG}} · ${{env.WRT_DATE}}
           files: ./wrt/upload/*.*
+          # 只出配置文件的测试编译标成预发布：“最新发布”永远指向真正的固件，服务器批量升级取的就是它
+          prerelease: ${{ inputs.WRT_TEST }}
           body: |
             固件版本：v${{env.WRT_VER}}（编译于 ${{env.WRT_DATE}}；路由器后台首页和管理页“固件”一栏显示的就是它）
 
