@@ -41,6 +41,19 @@ jobs:
           bash -n Scripts/Packages.sh
           sh -n Scripts/fleet/screen-defaults.sh
 
+      - name: Generated firmware files
+        run: |
+          # 用假的 curl 跑一遍 Fleet.sh（不下载国内名单），检查生成的开机脚本语法
+          mkdir -p /tmp/fake-bin /tmp/fleet-wrt
+          printf '#!/bin/sh\nout=""\nwhile [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift;; esac; shift; done\n{ printf SRS; head -c 20000 /dev/zero; } > "$out"\n' > /tmp/fake-bin/curl
+          chmod +x /tmp/fake-bin/curl
+          cd /tmp/fleet-wrt
+          PATH=/tmp/fake-bin:$PATH GITHUB_WORKSPACE=$GITHUB_WORKSPACE WRT_VER=0.0.0 WRT_DATE=26.01.01-00.00.00 bash $GITHUB_WORKSPACE/Scripts/Fleet.sh
+          for f in files/etc/uci-defaults/* files/etc/init.d/*; do sh -n "$f"; done
+          test -x files/www/fleet-setup/cgi-bin/api
+          grep -q '/usr/share/fleet/fleet-setup.lua' files/www/fleet-setup/cgi-bin/api
+          test -s files/www/fleet-setup/index.html
+
       - name: sing-box accepts the generated configs (pinned version)
         run: |
           VER=$(grep -oP '^SING_BOX_VERSION="\K[^"]+' Scripts/Packages.sh)

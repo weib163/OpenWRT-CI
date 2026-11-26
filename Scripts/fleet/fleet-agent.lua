@@ -1,11 +1,14 @@
 #!/usr/bin/lua
--- fleet-agent：从下发服务拉取本机配置，生成 sing-box 配置（家里设备：国内直连，海外 → VPN 节点 → 住宅 IP，
--- 链路断了海外就断网）；同步时顺带上报 CPU 温度、版本、WiFi、出口 IP 和出错情况，按下发服务的安排做批量升级（OTA）。
+-- fleet-agent：从下发服务拉取本机配置，生成 sing-box 配置（家里设备：国内直连，海外 → VPN 节点，节点再按客户
+-- 转到他的住宅 IP；住宅 IP 的账号密码不进路由器；链路断了海外就断网），按住宅 IP 所在地设时区（DHCP 也发给家里设备），
+-- 下载收款码给“上网设置”页；同步时顺带上报 CPU 温度、版本、WiFi、出口 IP 和出错情况，按下发服务的安排做批量升级（OTA）。
 --
 -- 开机运行一次，之后每 10 分钟由 cron 运行；调试时执行 fleet-agent --now（跳过随机等待）。
--- fleet-agent --health 由 cron 每分钟运行：超温告警开始或解除时马上同步一次（不等 10 分钟），
+-- fleet-agent --health 由 cron 每分钟运行：超温告警开始或解除时、服务器说有变化（续费、改设置）时马上同步一次，
 --   代理进程或它的防火墙规则没了就重启代理，设置还没完成的 WiFi，
---   并在雅典娜屏幕上插播提示（断网、管理通道断开、链路断开、到期、后台留言），屏幕编号旁边显示 WiFi 密码。
+--   并在雅典娜屏幕上插播提示（断网、管理通道断开、链路断开、到期倒计时、后台留言、改手机时区），
+--   屏幕编号旁边显示 WiFi 密码。
+-- fleet-agent --status：给“上网设置”页看的状态（JSON，不含密钥）。
 -- fleet-agent --proxy-init：代理服务启动前调用，没有配置时先写一份“海外断开、国内照常”的配置。
 -- fleet-agent --wifi-init：刷机或恢复出厂后第一次开机调用，设置这台的 WiFi 名字和密码。
 -- Tailscale 掉了登录（比如服务器重装过）时，用固件里的登录密钥自己重新登录（一小时最多一次）。
@@ -15,7 +18,7 @@
 -- 批量升级另外要 usign 和 /etc/fleet/fw-sign.pub。
 
 local M = {}
-M.VERSION = "1.3.0"
+M.VERSION = "1.4.0"
 M.STATE_FILE = "/etc/fleet/state.json"
 M.LAST_FILE = "/etc/fleet/last.json"
 M.ERROR_FILE = "/etc/fleet/last_error"
@@ -200,30 +203,45 @@ function M.validate_node(n)
 	return node
 end
 
--- 住宅 IP（SOCKS5）：地址只收 IPv4 和域名；用户名密码可以都不填（按 IP 白名单认证的）
-local function credential(v)
-	if v == nil then return "" end
-	if type(v) ~= "string" or #v > 128 or v:find("%c") then return nil end
-	return v
+-- 时区：IANA 名（America/Los_Angeles）、POSIX 写法（PST8PDT,M3.2.0,M11.1.0）、屏幕上显示的简称（UTC-8）
+function M.validate_timezone(t)
+	if type(t) ~= "table" then return nil, "不是对象" end
+	local zone, posix, label = str(t.zone), str(t.posix), str(t.label)
+	if not zone or #zone > 40 or not zone:match("^[%a][%w_]*/?[%w_/+%-]*$") then return nil, "zone" end
+	if not posix or #posix > 60 or not posix:match("^[%w<>+,.:/%-]+$") then return nil, "posix" end
+	if label and (#label > 12 or not label:match("^[A-Z0-9+:%-]+$")) then return nil, "label" end
+	return { zone = zone, posix = posix, label = label }
 end
 
-function M.validate_residential(x)
-	if type(x) ~= "table" then return nil, "不是对象" end
-	local server = str(x.server)
-	if not server or not M.is_node_address(server) then return nil, "server" end
-	local port = tonumber(x.port)
-	if not port or port ~= math.floor(port) or port < 1 or port > 65535 then return nil, "port" end
-	local user, pass = credential(x.username), credential(x.password)
-	if not user or not pass then return nil, "username/password" end
-	if (user == "") ~= (pass == "") then return nil, "用户名和密码要么都有，要么都不填" end
-	local udp = true
-	if x.udp ~= nil then
-		if type(x.udp) ~= "boolean" then return nil, "udp" end
-		udp = x.udp
+-- 收款码：管理页上传的图片清单（名字、sha256、大小）和价格说明；图片另外下载
+M.PAY_DIR = "/www/fleet-setup/pay"
+function M.validate_pay(p)
+	if type(p) ~= "table" then return nil, "不是对象" end
+	local version = str(p.version)
+	if not version or #version > 64 or not version:match("^%x+$") then return nil, "version" end
+	local text = p.text
+	if text ~= nil and (type(text) ~= "string" or #text > 1500 or text:find("[%z\1-\9\11-\31\127]")) then
+		return nil, "text"
 	end
-	local res = { server = server, port = port, udp = udp }
-	if user ~= "" then res.username, res.password = user, pass end
-	return res
+	local files = {}
+	if type(p.files) ~= "table" or #p.files > 4 then return nil, "files" end
+	for _, f in ipairs(p.files) do
+		if type(f) ~= "table" then return nil, "files" end
+		local name, sha, size = str(f.name), str(f.sha256), tonumber(f.size)
+		if not name or #name > 40 or not name:match("^[%w_%-]+%.png$") and not name:match("^[%w_%-]+%.jpg$") then
+			return nil, "files.name"
+		end
+		if not sha or #sha ~= 64 or not sha:match("^%x+$") then return nil, "files.sha256" end
+		if not size or size < 1 or size > 1048576 then return nil, "files.size" end
+		files[#files + 1] = { name = name, sha256 = sha:lower(), size = math.floor(size) }
+	end
+	return { version = version:lower(), text = text or "", files = files }
+end
+
+local function bool_or(v, default)
+	if v == nil then return default end
+	if type(v) ~= "boolean" then return nil end
+	return v
 end
 
 -- 校验下发服务的回复；任何一项不合格就整份丢弃（继续用旧配置）
@@ -244,9 +262,29 @@ function M.validate(r)
 	out.notice = M.clean_notice(r.notice)
 	if st == "unchanged" then return out end
 
-	-- 老服务器还会带 on_expire：只检查格式，不再使用（到期一律海外断开，没有直连）
-	if r.on_expire ~= nil and r.on_expire ~= "block" and r.on_expire ~= "direct" then
-		return nil, "on_expire 不合法"
+	-- 不管什么状态都带的：直连名单（管理通道）、到期时间、时区、收款码
+	out.direct = {}
+	if r.direct ~= nil then
+		if type(r.direct) ~= "table" or #r.direct > 20 then return nil, "direct 不合法" end
+		for _, d in ipairs(r.direct) do
+			if not (M.is_address(d) or M.is_cidr(d)) then return nil, "direct 里有不合法的项" end
+			out.direct[#out.direct + 1] = d
+		end
+	end
+	if r.expire_at ~= nil then
+		local e = tonumber(r.expire_at)
+		if not e or e < 0 or e > 4102444800 then return nil, "expire_at 不合法" end
+		out.expire_at = math.floor(e)
+	end
+	if r.timezone ~= nil then
+		local tz, why = M.validate_timezone(r.timezone)
+		if not tz then return nil, "timezone 不合法：" .. why end
+		out.timezone = tz
+	end
+	if r.pay ~= nil then
+		local pay, why = M.validate_pay(r.pay)
+		if not pay then return nil, "pay 不合法：" .. why end
+		out.pay = pay
 	end
 	if st ~= "active" then return out end
 
@@ -272,19 +310,13 @@ function M.validate(r)
 	if tol < 0 or tol > 10000 then return nil, "auto.tolerance 不合法" end
 	out.auto = { url = url, interval = interval, tolerance = math.floor(tol) }
 
-	out.direct = {}
-	if r.direct ~= nil then
-		if type(r.direct) ~= "table" or #r.direct > 20 then return nil, "direct 不合法" end
-		for _, d in ipairs(r.direct) do
-			if not (M.is_address(d) or M.is_cidr(d)) then return nil, "direct 里有不合法的项" end
-			out.direct[#out.direct + 1] = d
-		end
-	end
-	if r.residential ~= nil then
-		local res, why = M.validate_residential(r.residential)
-		if not res then return nil, "residential 不合法：" .. why end
-		out.residential = res
-	end
+	-- 住宅 IP 不支持 UDP（服务器实测）：海外 UDP 在路由器上就拒绝，网页马上改走 TCP
+	out.udp = bool_or(r.udp, true)
+	-- 全部走 VPN：不做国内直连（专门养号的设备）
+	out.global = bool_or(r.global, false)
+	-- 服务器有没有给这个用户分配住宅 IP；没分配时服务器那头是拒绝的，屏幕显示 NO IP
+	out.has_residential = bool_or(r.has_residential, true)
+	if out.udp == nil or out.global == nil or out.has_residential == nil then return nil, "udp/global/has_residential 不合法" end
 	return out
 end
 
@@ -350,7 +382,7 @@ function M.encode_json(v, indent)
 end
 
 -- ------------------------------------------------------------ sing-box 配置
--- 家里的设备（br-lan）进 TUN：国内直连；海外 → VPN 节点 → 住宅 IP。链路断了海外就断，没有直连退路。
+-- 家里的设备（br-lan）进 TUN：国内直连；海外 → VPN 节点（服务器再转到住宅 IP）。链路断了海外就断，没有直连退路。
 -- 路由器自己的流量（Tailscale、本脚本、对时）不进 TUN，所以代理出问题时照样能远程管理。
 M.PROXY_FILE = "/etc/fleet/proxy.json"
 M.RULE_DIR = "/usr/share/fleet"
@@ -401,10 +433,12 @@ local function vless_outbound(node)
 	return o
 end
 
--- 按配置算出代理模式：chain = 正常走链路；noip = 开通了但还没分配住宅 IP；block = 其他情况（海外断开）
+-- 代理模式：vpn = 正常（海外进 VPN 节点，服务器再按客户转到他的住宅 IP）；
+-- noip = 开通了但服务器还没分配住宅 IP：海外断开（绝不从机房 IP 出去），屏幕显示 NO IP；
+-- block = 其他情况（到期、停用、待开通……）：海外断开，国内照常
 function M.proxy_mode(cfg)
 	if cfg and cfg.status == "active" and cfg.nodes then
-		return cfg.residential and "chain" or "noip"
+		return (cfg.has_residential == false) and "noip" or "vpn"
 	end
 	return "block"
 end
@@ -412,6 +446,7 @@ end
 -- cfg：校验过的下发配置（或只带 direct 的空壳）；rules：国内名单文件在不在
 function M.proxy_config(cfg, rules)
 	local mode = M.proxy_mode(cfg)
+	local global = mode == "vpn" and cfg.global == true
 	local domains, ips = array(), array()
 	for _, d in ipairs((cfg and cfg.direct) or {}) do
 		if M.is_ipv4(d) or M.is_ipv6(d) or M.is_cidr(d) then ips[#ips + 1] = d else domains[#domains + 1] = d end
@@ -421,6 +456,8 @@ function M.proxy_config(cfg, rules)
 	route_rules[#route_rules + 1] = { inbound = array({ "dns-in" }), action = "hijack-dns" }
 	route_rules[#route_rules + 1] = { action = "sniff" }
 	route_rules[#route_rules + 1] = { protocol = array({ "dns" }), action = "hijack-dns" }
+	-- 双保险：IPv6 一律拒绝（固件本来就只用 IPv4）
+	route_rules[#route_rules + 1] = { ip_cidr = array({ "::/0" }), action = "reject" }
 	route_rules[#route_rules + 1] = { ip_cidr = array(M.PRIVATE), action = "route", outbound = "direct" }
 	if #ips > 0 then route_rules[#route_rules + 1] = { ip_cidr = ips, action = "route", outbound = "direct" } end
 	if #domains > 0 then
@@ -428,7 +465,7 @@ function M.proxy_config(cfg, rules)
 		dns_rules[#dns_rules + 1] = { domain_suffix = domains, action = "route", server = "local" }
 	end
 	local rule_set
-	if rules then
+	if rules and not global then
 		rule_set = array({
 			{ type = "local", tag = "geosite-cn", format = "binary", path = M.RULE_DIR .. "/geosite-cn.srs" },
 			{ type = "local", tag = "geoip-cn", format = "binary", path = M.RULE_DIR .. "/geoip-cn.srs" },
@@ -445,7 +482,10 @@ function M.proxy_config(cfg, rules)
 		{ type = "direct", tag = "dns-in", listen = "127.0.0.1", listen_port = M.DNS_PORT },
 	})
 	local final, dns_final = "direct", "local"
-	if mode == "chain" then
+	if mode ~= "vpn" then
+		-- 海外一律拒绝；国内照常
+		route_rules[#route_rules + 1] = { action = "reject" }
+	else
 		local members = array()
 		for _, node in ipairs(cfg.nodes) do
 			local o = vless_outbound(node)
@@ -455,20 +495,13 @@ function M.proxy_config(cfg, rules)
 		outbounds[#outbounds + 1] = { type = "urltest", tag = "vpn", outbounds = members, url = cfg.auto.url,
 			interval = cfg.auto.interval, tolerance = cfg.auto.tolerance, idle_timeout = "30m",
 			interrupt_exist_connections = false }
-		local res = cfg.residential
-		outbounds[#outbounds + 1] = { type = "socks", tag = "residential", version = "5", server = res.server,
-			server_port = res.port, username = res.username, password = res.password, detour = "vpn",
-			network = (not res.udp) and "tcp" or nil }
-		-- 海外的域名经住宅 IP 去查：不泄露，查到的也是住宅 IP 那边的结果。用 DoH（443 端口、加密）：
-		-- 有的住宅 IP 不放行 53 端口，走 443 最稳
-		dns_servers[#dns_servers + 1] = { type = "https", tag = "remote", server = M.REMOTE_DNS, detour = "residential" }
-		dns_final, final = "remote", "residential"
+		-- 海外的域名经 VPN 用 DoH 去查（443 端口、加密）：服务器把这个客户的流量（包括 DNS）都转到他的住宅 IP，
+		-- 所以 DNS 和数据同一个出口、同一个地区
+		dns_servers[#dns_servers + 1] = { type = "https", tag = "remote", server = M.REMOTE_DNS, detour = "vpn" }
+		dns_final, final = "remote", "vpn"
 		inbounds[#inbounds + 1] = { type = "mixed", tag = "probe-in", listen = "127.0.0.1", listen_port = M.PROBE_PORT }
-		-- 住宅 IP 不支持 UDP：海外 UDP 直接拒绝（网页会改用 TCP），绝不直连
-		if not res.udp then route_rules[#route_rules + 1] = { network = array({ "udp" }), action = "reject" } end
-	else
-		-- 海外一律拒绝；国内照常
-		route_rules[#route_rules + 1] = { action = "reject" }
+		-- 住宅 IP 不支持 UDP：海外 UDP 在路由器上就拒绝（网页马上改走 TCP），绝不直连
+		if cfg.udp == false then route_rules[#route_rules + 1] = { network = array({ "udp" }), action = "reject" } end
 	end
 
 	return {
@@ -737,9 +770,10 @@ function M.discover(status)
 	return best
 end
 
--- 用 uclient-fetch 取回复；返回 body 或 nil（任何非 200 都算失败）
-function M.fetch(url, timeout)
-	local out = M.env.exec("uclient-fetch -q -T " .. tonumber(timeout or 20) .. " -O - " .. shell_quote(url)
+-- 用 uclient-fetch 取回复；post 不为空就用 POST 发出去。返回 body 或 nil（任何非 200 都算失败）
+function M.fetch(url, timeout, post)
+	local out = M.env.exec("uclient-fetch -q -T " .. tonumber(timeout or 20)
+		.. (post and (" --post-data=" .. shell_quote(post)) or "") .. " -O - " .. shell_quote(url)
 		.. " 2>/dev/null; echo \"__FLEET_RC=$?\"")
 	local body, rc = out:match("^(.*)__FLEET_RC=(%d+)%s*$")
 	if not body or rc ~= "0" or body == "" then return nil end
@@ -891,13 +925,23 @@ local SCREEN_STATUS_TEXT = { expired = "EXPIRED", limited = "LIMIT", disabled = 
 -- 屏幕上要插播的提示（只用屏幕字库里有的字符）和它是否紧急；一切正常返回 nil
 -- 顺序：断网 > 管理通道断开 > 链路断开 > 后台留言 > 账号状态 > 没分配住宅 IP
 function M.screen_message(ctx)
-	if ctx.wan_up == false then return "NET DOWN", true end
+	-- 断网时顺带提示“上网设置”页的地址（宽带拨号在那里填）
+	if ctx.wan_up == false then return "NET DOWN" .. (ctx.lan_ip and (" " .. ctx.lan_ip) or ""), true end
 	if ctx.ts_up == false then return "TS DOWN", true end
 	if ctx.chain == "down" and ctx.status == "active" then return "PROXY ERR", true end
 	if ctx.notice then return ctx.notice, false end
 	local text = SCREEN_STATUS_TEXT[ctx.status or ""]
 	if text then return text, false end
+	local now = ctx.now or 0
+	if ctx.status == "active" and type(ctx.expire_at) == "number" and ctx.expire_at - now <= 7 * 86400 then
+		local days = math.max(0, math.ceil((ctx.expire_at - now) / 86400))
+		return days == 0 and "EXP TODAY" or ("EXP " .. days .. "D"), false
+	end
 	if ctx.chain == "noip" and ctx.status == "active" then return "NO IP", false end
+	if type(ctx.tz_at) == "number" and now - ctx.tz_at < 3 * 86400 then
+		local label = type(ctx.tz_label) == "string" and ctx.tz_label:match("^[A-Z0-9+:%-]+$") and ctx.tz_label
+		return "TZ " .. (label or "CHANGED") .. " SET PHONE", false
+	end
 	return nil
 end
 
@@ -988,33 +1032,110 @@ function M.screen_tick(c, ctx)
 	end
 end
 
--- 按回复生成代理配置、管好 DNS。返回 { proxy = 配置变了, dns = DNS 设置变了, code = 错误代码, mode = 代理模式 }
+-- 按回复生成代理配置、管好 DNS 和时区。
+-- 返回 { proxy = 配置变了, dns = DNS 设置变了, tz = 时区变了, code = 错误代码, mode = 代理模式, cfg = 用到的配置 }
 function M.handle(c, resp, state)
-	local st, cfg = resp.status, nil
-	if st == "active" then
+	local cfg
+	if resp.status == "unchanged" then
+		local last = M.read_json(M.LAST_FILE)
+		cfg = last and M.validate(last)
+		if not cfg or cfg.status == "unchanged" then
+			state.version = nil -- 上次的完整配置丢了：下一轮要完整配置（这一轮不动收款码、到期时间、时区）
+			cfg = { status = "blocked", direct = {}, fallback = true }
+		end
+	else
+		-- 每份完整回复都存下来；停用、到期的回复里没有节点和 UUID，存进去也就把它们删了
 		cfg = resp
 		M.write_json(M.LAST_FILE, resp)
-	else
-		local last = M.read_json(M.LAST_FILE)
-		local prev = last and M.validate(last)
-		if st == "unchanged" and state.status == "active" then
-			if prev and prev.status == "active" then
-				cfg = prev -- 每轮按上次的完整配置重新生成：配置文件被改了也会改回来
-			else
-				state.version = nil -- 上次的完整配置丢了：下一轮要完整配置
-			end
-		end
-		if st == "disabled" then M.env.remove(M.LAST_FILE) end -- 主动停用：节点和 UUID 一起删掉
-		cfg = cfg or { status = "blocked", direct = (prev and prev.direct) or {} }
 	end
 	local rules = M.rules_ok()
-	local res = { mode = M.proxy_mode(cfg) }
+	local res = { mode = M.proxy_mode(cfg), cfg = cfg }
 	if not rules then res.code = "no_rules" end
 	local changed, code = M.apply_proxy(M.encode_json(M.proxy_config(cfg, rules)) .. "\n")
 	res.proxy = changed
 	res.code = code or res.code
 	res.dns = M.ensure_dns(c, M.mgmt_domains(c, cfg))
+	local tz_changed, dhcp_changed = M.apply_timezone(c, cfg.timezone)
+	res.tz = tz_changed
+	res.dns = res.dns or dhcp_changed
 	return res
+end
+
+-- 时区跟住宅 IP 所在地：系统时区（屏幕时钟跟着变），再用 DHCP 选项 100（POSIX 写法）和 101（IANA 名）发给家里设备，
+-- 支持的设备会自动改。返回 系统时区变了, DHCP 设置变了
+function M.apply_timezone(c, tz)
+	if not tz then return false, false end
+	local changed, dhcp_changed = false, false
+	local sec
+	c:foreach("system", "system", function(s) sec = sec or s[".name"] end)
+	-- 系统设置里的时区名用空格（LuCI 的写法：America/Los Angeles），开机脚本会换回下划线找时区文件
+	local zonename = tz.zone:gsub("_", " ")
+	if sec and (c:get("system", sec, "zonename") ~= zonename or c:get("system", sec, "timezone") ~= tz.posix) then
+		c:set("system", sec, "zonename", zonename)
+		c:set("system", sec, "timezone", tz.posix)
+		c:commit("system")
+		M.env.run("/etc/init.d/system reload >/dev/null 2>&1")
+		changed = true
+	end
+	if c:get("dhcp", "lan") then
+		local cur = c:get("dhcp", "lan", "dhcp_option")
+		if type(cur) ~= "table" then cur = cur and { cur } or {} end
+		local want = {}
+		for _, o in ipairs(cur) do
+			if not o:match("^100,") and not o:match("^101,") then want[#want + 1] = o end
+		end
+		want[#want + 1] = '100,"' .. tz.posix .. '"'
+		want[#want + 1] = '101,"' .. tz.zone .. '"'
+		local same = #cur == #want
+		for i = 1, #want do
+			if cur[i] ~= want[i] then same = false end
+		end
+		if not same then
+			c:set("dhcp", "lan", "dhcp_option", want)
+			c:commit("dhcp")
+			dhcp_changed = true
+		end
+	end
+	return changed, dhcp_changed
+end
+
+-- 收款码：版本变了才下载；每张图核对大小和 sha256，有一张不对就整批不换。返回 changed, 错误
+-- （图片内容不进 Lua：大小、哈希、挪位置都交给命令做）
+function M.sync_pay(base, pay)
+	local info_path = M.PAY_DIR .. "/info.json"
+	local cur = M.read_json(info_path)
+	local want_version = pay and pay.version or ""
+	if cur and cur.version == want_version then return false end
+	M.env.run("mkdir -p " .. M.PAY_DIR .. " /tmp/fleet/pay")
+	local fetched = {}
+	for _, f in ipairs(pay and pay.files or {}) do
+		local tmp = "/tmp/fleet/pay/" .. f.name
+		M.env.remove(tmp)
+		if not M.download(base .. "/v1/pay/" .. f.name .. "?v=" .. want_version, tmp, 30) then
+			return false, "下载 " .. f.name .. " 失败"
+		end
+		local out = M.env.exec("wc -c < " .. shell_quote(tmp) .. " 2>/dev/null; sha256sum " .. shell_quote(tmp)
+			.. " 2>/dev/null")
+		local size, sum = out:match("^%s*(%d+)%s+(%x+)")
+		if tonumber(size) ~= f.size or (sum or ""):lower() ~= f.sha256 then
+			M.env.remove(tmp)
+			return false, f.name .. " 校验不对"
+		end
+		fetched[#fetched + 1] = f.name
+	end
+	local keep, list = {}, array()
+	for _, name in ipairs(fetched) do
+		M.env.run("mv -f " .. shell_quote("/tmp/fleet/pay/" .. name) .. " " .. shell_quote(M.PAY_DIR .. "/" .. name))
+		keep[name] = true
+		list[#list + 1] = name
+	end
+	for _, old in ipairs((cur and type(cur.files) == "table") and cur.files or {}) do
+		if type(old) == "string" and not keep[old] and old:match("^[%w_%-]+%.[pj][np]g$") then
+			M.env.remove(M.PAY_DIR .. "/" .. old)
+		end
+	end
+	M.write_json(info_path, { version = want_version, text = pay and pay.text or "", files = list })
+	return true
 end
 
 -- 经整条链路查出口 IP（Cloudflare 的 trace 页面）；查不到返回 nil
@@ -1149,21 +1270,16 @@ function M.run(opts)
 		math.randomseed(seed_from(tostring(self_ips[1] or "")))
 		M.env.sleep(math.random(0, 240))
 	end
-	local server = conf.server
-	if server == "" then server = M.discover(ts) end
-	if not server or not M.is_address(server) then
+	local base = M.server_base(conf, ts)
+	if not base then
 		M.env.log("没找到下发服务器（带 " .. M.FLEET_TAG .. " 标签的设备），跳过这一轮")
 		return 0
 	end
-	local port = tonumber(conf.port) or 8080
-	if port < 1 or port > 65535 then port = 8080 end
 
 	local build, board = M.build_id(), M.board_name()
 	local err = M.check_last_upgrade(build) or M.last_error()
 	local state = M.read_json(M.STATE_FILE) or {}
 	local ver = (type(state.version) == "string" and state.version:match("^%x*$")) and state.version or ""
-	local host = M.is_ipv6(server) and ("[" .. server .. "]") or server
-	local base = string.format("http://%s:%d", host, port)
 	local url = string.format("%s/v1/config?ver=%s&fw=%s&build=%s&agent=%s&board=%s&ts=%s&pw=%s&err=%s",
 		base, ver, urlencode(M.firmware_version()), urlencode(build), urlencode(M.VERSION), urlencode(board),
 		urlencode(M.tailscale_version()), urlencode(M.proxy_version()), urlencode(err))
@@ -1212,9 +1328,9 @@ function M.run(opts)
 	end
 	if res.dns then M.env.restart_dnsmasq() end
 
-	-- 正常走链路时经整条链路查一次出口 IP：查不到就报 chain_down（管理页告警，屏幕显示 PROXY ERR）
+	-- 正常时经整条链路（VPN → 服务器 → 住宅 IP）查一次出口 IP：查不到就报 chain_down（管理页告警，屏幕显示 PROXY ERR）
 	local chain, egress = nil, nil
-	if res.mode == "chain" then
+	if res.mode == "vpn" then
 		M.env.sleep(res.proxy and 5 or 0)
 		egress = M.probe()
 		if not egress then
@@ -1223,7 +1339,7 @@ function M.run(opts)
 		end
 		chain = egress and "ok" or "down"
 		if not egress then
-			M.env.log("经住宅 IP 连不出去：海外网站现在打不开（国内正常）")
+			M.env.log("经 VPN 连不出去：海外网站现在打不开（国内正常）")
 			if new_err == "" then new_err = "chain_down" end
 		elseif egress ~= state.egress then
 			M.env.log("出口 IP：" .. egress)
@@ -1232,19 +1348,48 @@ function M.run(opts)
 		chain = "noip"
 	end
 
+	if res.tz then
+		M.env.log("时区改成 " .. res.cfg.timezone.zone .. "（跟住宅 IP 所在地）")
+		M.env.restart_screen()
+	end
+	local cfg = res.cfg or {}
+	-- 处理出错或上次的完整配置丢了时不动收款码；完整回复里没有收款码就删掉旧的
+	local full = res.cfg ~= nil and not cfg.fallback
+	if full and (cfg.pay ~= nil or M.env.exists(M.PAY_DIR .. "/info.json")) then
+		local pok2, pchanged, perr = pcall(M.sync_pay, base, cfg.pay)
+		if not pok2 or perr then
+			M.env.log("收款码没更新：" .. tostring(pok2 and perr or pchanged))
+		elseif pchanged then
+			M.env.log("收款码已更新")
+		end
+	end
+
 	local unchanged = resp.status == "unchanged"
+	local expire_at = tonumber(state.expire_at)
+	if full then expire_at = cfg.expire_at end
+	-- 注意不能写成 unchanged and state.version or resp.version：state.version 被清空（上次的完整配置丢了）时
+	-- 会落到回复里的版本号，路由器就一直拿“没变化”，再也要不到完整配置
+	local version = resp.version
+	if unchanged then version = state.version end
 	local new_state = {
-		version = unchanged and state.version or resp.version,
+		version = version,
 		status = unchanged and state.status or resp.status,
 		notice = unchanged and M.clean_notice(state.notice) or resp.notice,
 		chain = chain,
 		egress = egress,
+		expire_at = expire_at,
+		-- 时区刚设好或变了：屏幕连续 3 天提醒客户改手机时区
+		tz_at = res.tz and M.env.now() or state.tz_at,
+		tz_label = cfg.timezone and cfg.timezone.label or state.tz_label,
+		tz_zone = cfg.timezone and cfg.timezone.zone or state.tz_zone,
 	}
 	if not hok or res.code == "proxy_check" or res.code == "proxy_write" then
 		new_state.version = nil -- 没写成：下次要完整配置
 	end
 	if new_state.version ~= state.version or new_state.status ~= state.status or new_state.chain ~= state.chain
-		or new_state.egress ~= state.egress or new_state.notice ~= state.notice then
+		or new_state.egress ~= state.egress or new_state.notice ~= state.notice
+		or new_state.expire_at ~= state.expire_at or new_state.tz_at ~= state.tz_at
+		or new_state.tz_label ~= state.tz_label or new_state.tz_zone ~= state.tz_zone then
 		M.write_json(M.STATE_FILE, new_state) -- 只在有变化时写闪存
 	end
 
@@ -1329,13 +1474,107 @@ function M.health_run()
 	M.proxy_watchdog()
 
 	local state = M.read_json(M.STATE_FILE) or {}
+	-- 管理页刚续费、改了设置：服务器说有变化就马上同步（不用等 10 分钟）
+	if fleet_on and ts_up and M.ping(conf, ts, state) then
+		sync({ now = true })
+		state = M.read_json(M.STATE_FILE) or {}
+	end
 	local _, wifi_key = M.wifi_info(c)
+	local lan_ip = c:get("network", "lan", "ipaddr")
+	if type(lan_ip) == "table" then lan_ip = lan_ip[1] end
+	if type(lan_ip) == "string" then lan_ip = lan_ip:match("^([%d%.]+)") end
+	M.ensure_setup_redirect(c, lan_ip)
 	M.screen_tick(M.env.cursor(), {
 		ts = ts, ts_up = ts_up, wan_up = M.wan_up(), threshold = threshold,
 		status = state.status, notice = M.clean_notice(state.notice),
-		chain = state.chain, wifi_key = wifi_key,
+		chain = state.chain, wifi_key = wifi_key, now = M.env.now(),
+		expire_at = tonumber(state.expire_at), tz_at = tonumber(state.tz_at), tz_label = state.tz_label,
+		lan_ip = lan_ip and M.is_ipv4(lan_ip) and lan_ip or nil,
 	})
 	return 0
+end
+
+-- 下发服务器的地址（http://IP:端口）；找不到返回 nil
+function M.server_base(conf, ts)
+	local server = conf.server
+	if server == "" then server = M.discover(ts) end
+	if not server or not M.is_address(server) then return nil end
+	local port = tonumber(conf.port) or 8080
+	if port < 1 or port > 65535 then port = 8080 end
+	local host = M.is_ipv6(server) and ("[" .. server .. "]") or server
+	return string.format("http://%s:%d", host, port)
+end
+
+-- 家里设备打开 http://路由器地址 （80 端口）转到上网设置页（81 端口）：内网地址被改过就跟着改。返回 changed
+function M.ensure_setup_redirect(c, lan_ip)
+	if not lan_ip or not M.is_ipv4(lan_ip) then return false end
+	if c:get("firewall", "fleet_setup_redirect") ~= "redirect" then return false end
+	if c:get("firewall", "fleet_setup_redirect", "src_dip") == lan_ip then return false end
+	c:set("firewall", "fleet_setup_redirect", "src_dip", lan_ip)
+	c:commit("firewall")
+	M.env.run("/etc/init.d/firewall reload >/dev/null 2>&1")
+	M.env.log("内网地址改成了 " .. lan_ip .. "，上网设置页的转发规则跟着改")
+	return true
+end
+
+-- 每分钟一次的轻量询问：服务器回 {"sync": true}（管理页刚续费、改了设置）就马上同步
+function M.ping(conf, ts, state)
+	local base = M.server_base(conf, ts)
+	if not base then return false end
+	local ver = (type(state.version) == "string" and state.version:match("^%x*$")) and state.version or ""
+	local body = M.fetch(base .. "/v1/ping?ver=" .. ver, 5)
+	local ok, v = pcall(json().parse, body or "")
+	return ok and type(v) == "table" and v.sync == true
+end
+
+local function tailscale_status()
+	local ok, v = pcall(json().parse, M.env.exec("tailscale status --json 2>/dev/null"))
+	return ok and type(v) == "table" and v or nil
+end
+
+-- 客户在“上网设置”页点了“我已付款”：告诉下发服务器（管理页出现待确认，并推送提醒）。返回 true 或 nil, 原因
+function M.paid(channel)
+	if channel ~= "wechat" and channel ~= "alipay" then channel = "" end
+	local c = M.env.cursor()
+	local conf = read_conf(c)
+	if conf.enabled ~= "1" then return nil, "disabled" end
+	local ts = tailscale_status()
+	if not ts or ts.BackendState ~= "Running" then return nil, "no_tailscale" end
+	local base = M.server_base(conf, ts)
+	if not base then return nil, "no_server" end
+	local body = M.fetch(base .. "/v1/paid", 10, "ch=" .. channel)
+	local ok, v = pcall(json().parse, body or "")
+	if ok and type(v) == "table" and v.ok == true then return true end
+	return nil, "server"
+end
+
+-- 给“上网设置”页看的状态（不含任何密钥）
+function M.status_info()
+	local c = M.env.cursor()
+	local ts = tailscale_status()
+	local state = M.read_json(M.STATE_FILE) or {}
+	local ssid = M.wifi_info(c)
+	local pay = M.read_json(M.PAY_DIR .. "/info.json")
+	local files = array()
+	for _, name in ipairs((pay and type(pay.files) == "table") and pay.files or {}) do
+		if type(name) == "string" and name:match("^[%w_%-]+%.[pj][np]g$") then files[#files + 1] = name end
+	end
+	return {
+		device = M.screen_id(ts) or "",
+		firmware = M.firmware_version(),
+		wan_up = M.wan_up(),
+		ts_up = ts ~= nil and ts.BackendState == "Running"
+			and not (type(ts.Self) == "table" and ts.Self.Online == false),
+		status = type(state.status) == "string" and state.status or "",
+		chain = type(state.chain) == "string" and state.chain or "",
+		expire_at = tonumber(state.expire_at),
+		tz = type(state.tz_label) == "string" and state.tz_label or "",
+		tz_zone = type(state.tz_zone) == "string" and state.tz_zone or "",
+		ssid = ssid or "",
+		pay_text = (pay and type(pay.text) == "string") and pay.text or "",
+		pay_files = files,
+		pay_version = (pay and type(pay.version) == "string") and pay.version or "",
+	}
 end
 
 -- 代理进程没了、或它的防火墙规则（nftables 的 sing-box 表）被清掉了：重启代理，5 分钟最多一次。
@@ -1362,10 +1601,15 @@ function M.main(argv)
 		if a == "--version" then print(M.VERSION) return 0 end
 		if a == "--proxy-init" then opts.proxy_init = true end
 		if a == "--wifi-init" then opts.wifi_init = true end
+		if a == "--status" then opts.status = true end
 	end
-	-- /etc/fleet 里有住宅 IP 的账号密码：只有 root 能进
+	-- /etc/fleet 里有节点的 UUID：只有 root 能进
 	M.env.run("mkdir -p /etc/fleet /tmp/fleet && chmod 700 /etc/fleet")
 	if opts.proxy_init then return M.proxy_init() end
+	if opts.status then
+		print(M.encode_json(M.status_info()))
+		return 0
+	end
 	if opts.wifi_init then
 		M.wifi_init(M.env.cursor())
 		return 0

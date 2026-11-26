@@ -9,10 +9,15 @@
 #   6. 复位键：短按重启；长按 30 秒以上才恢复出厂（防止客户随手一按把配置清空）
 #   7. 网页终端 ttyd 改为所有接口监听，Headscale 内网才能打开（外网仍被防火墙挡住）
 #   8. 可选：设置 root 密码（GitHub Secret ROOT_PW_HASH，只在密码为空时生效）
-#   9. 代理：sing-box 由 fleet-proxy 服务运行（家里设备：国内直连，海外 → VPN 节点 → 住宅 IP），
-#      国内名单（geosite-cn / geoip-cn）编译时打包；防火墙不许家里设备绕开代理直接上网（断网保护）
+#   9. 代理：sing-box 由 fleet-proxy 服务运行（家里设备：国内直连，海外 → VPN 节点；服务器再把每个客户
+#      转到他自己的住宅 IP，住宅 IP 的账号密码不进路由器），国内名单（geosite-cn / geoip-cn）编译时打包；
+#      防火墙不许家里设备绕开代理直接上网（断网保护）
 #  10. WiFi：每台独立的名字（前缀-设备码）和密码；带了种子（GitHub Secret WIFI_SEED）时密码每台固定，恢复出厂不变
 #  11. 升级时保留 fleet 的设置和上次的代理配置（升级后马上用上，不用等第一次同步）
+#  12. 上网设置页：家里打开 http://路由器地址 看状态、收款码、点“我已付款”，用 WiFi 密码登录后改宽带设置、
+#      手动升级（只认签过名的升级包）。完整后台（LuCI）、SSH、网页终端在家里打不开，只能经 Headscale 内网
+#  13. 去掉 UPnP（家里设备不能自己在路由器上开端口、绕开代理收外网连接）
+#  14. 可选：只认管理员的 SSH 公钥（GitHub 仓库变量 ADMIN_SSH_PUBKEY），不再接受密码登录 SSH
 # 在 ./wrt/ 目录下运行。
 set -e
 
@@ -22,6 +27,7 @@ mkdir -p "$FILES_DIR/usr/bin" "$FILES_DIR/etc/config" "$FILES_DIR/etc/init.d" "$
 	"$FILES_DIR/etc/fleet" "$FILES_DIR/etc/rc.button" "$FILES_DIR/usr/share/fleet" "$FILES_DIR/lib/upgrade/keep.d"
 
 install -m 755 "$SRC/fleet-agent.lua" "$FILES_DIR/usr/bin/fleet-agent"
+install -m 644 "$SRC/fleet-setup.lua" "$FILES_DIR/usr/share/fleet/fleet-setup.lua"
 # 固件版本号 + 编译日期，例如 1.1.0-26.11.23：fleet-agent 同步时报给管理页“固件”一栏
 if [ -n "$WRT_VER" ]; then
 	printf '%s-%s\n' "$WRT_VER" "${WRT_DATE%%-*}" > "$FILES_DIR/etc/fleet-firmware"
@@ -270,6 +276,94 @@ uci commit ttyd
 exit 0
 EOF
 
+# 上网设置页：独立的 uhttpd（81 端口），家里打开 http://路由器地址（80 端口）由防火墙转过来
+mkdir -p "$FILES_DIR/www/fleet-setup/cgi-bin" "$FILES_DIR/www/fleet-setup/pay"
+install -m 644 "$SRC/setup-page.html" "$FILES_DIR/www/fleet-setup/index.html"
+cat > "$FILES_DIR/www/fleet-setup/cgi-bin/api" <<'EOF'
+#!/usr/bin/lua
+dofile("/usr/share/fleet/fleet-setup.lua").cgi()
+EOF
+chmod 755 "$FILES_DIR/www/fleet-setup/cgi-bin/api"
+
+cat > "$FILES_DIR/etc/uci-defaults/98-fleet-setup" <<'EOF'
+#!/bin/sh
+# 上网设置页（81 端口，只放 /www/fleet-setup）
+uci -q delete uhttpd.fleetsetup
+uci set uhttpd.fleetsetup=uhttpd
+uci add_list uhttpd.fleetsetup.listen_http='0.0.0.0:81'
+uci set uhttpd.fleetsetup.home='/www/fleet-setup'
+uci set uhttpd.fleetsetup.cgi_prefix='/cgi-bin'
+uci set uhttpd.fleetsetup.index_page='index.html'
+uci set uhttpd.fleetsetup.max_requests='4'
+uci set uhttpd.fleetsetup.max_connections='16'
+uci set uhttpd.fleetsetup.script_timeout='300'
+uci set uhttpd.fleetsetup.network_timeout='60'
+uci set uhttpd.fleetsetup.http_keepalive='0'
+uci set uhttpd.fleetsetup.tcp_keepalive='1'
+uci set uhttpd.fleetsetup.no_dirlists='1'
+uci set uhttpd.fleetsetup.rfc1918_filter='1'
+uci set uhttpd.fleetsetup.redirect_https='0'
+uci commit uhttpd
+
+# 家里打开 http://路由器地址（80 端口）→ 上网设置页（81 端口）。内网地址改了 fleet-agent 会跟着改这条
+LAN_IP=$(uci -q get network.lan.ipaddr | cut -d/ -f1)
+[ -n "$LAN_IP" ] || LAN_IP=192.168.10.1
+uci -q delete firewall.fleet_setup_redirect
+uci set firewall.fleet_setup_redirect=redirect
+uci set firewall.fleet_setup_redirect.name='fleet-setup-page'
+uci set firewall.fleet_setup_redirect.src='lan'
+uci set firewall.fleet_setup_redirect.family='ipv4'
+uci set firewall.fleet_setup_redirect.proto='tcp'
+uci set firewall.fleet_setup_redirect.src_dip="$LAN_IP"
+uci set firewall.fleet_setup_redirect.src_dport='80'
+uci set firewall.fleet_setup_redirect.dest_port='81'
+uci set firewall.fleet_setup_redirect.target='DNAT'
+
+# 家里打不开完整后台（80/443）、SSH（22）、网页终端（7681）：只能经 Headscale 内网（tailscale 区不受影响）
+uci -q delete firewall.fleet_lan_no_admin
+uci set firewall.fleet_lan_no_admin=rule
+uci set firewall.fleet_lan_no_admin.name='fleet-lan-no-admin'
+uci set firewall.fleet_lan_no_admin.src='lan'
+uci set firewall.fleet_lan_no_admin.proto='tcp'
+uci set firewall.fleet_lan_no_admin.dest_port='22 80 443 7681'
+uci set firewall.fleet_lan_no_admin.target='REJECT'
+uci commit firewall
+
+# 去掉 UPnP：别的配置万一带进来，也不让它运行
+if [ -x /etc/init.d/miniupnpd ]; then
+	/etc/init.d/miniupnpd disable
+	uci -q set upnpd.config.enabled='0' && uci commit upnpd
+fi
+exit 0
+EOF
+
+# 只认管理员的 SSH 公钥（可选）。SSH 本来就只能经 Headscale 内网连，这是再加一道
+SSH_LINES=$(printf '%s\n' "$ADMIN_SSH_PUBKEY" | tr -d '\r' | grep -v '^[[:space:]]*$' || true)
+SSH_KEYS=$(printf '%s\n' "$SSH_LINES" | grep -E '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) [A-Za-z0-9+/=]{60,800}( [^[:cntrl:]]{0,100})?$' || true)
+if [ -n "$SSH_LINES" ] && [ "$SSH_KEYS" != "$SSH_LINES" ]; then
+	echo "::error::ADMIN_SSH_PUBKEY 格式不对：每行一把 ssh-ed25519/ssh-rsa 公钥（.pub 文件的内容）"
+	exit 1
+fi
+if [ -n "$SSH_KEYS" ]; then
+	mkdir -p "$FILES_DIR/etc/dropbear"
+	printf '%s\n' "$SSH_KEYS" > "$FILES_DIR/etc/dropbear/authorized_keys"
+	chmod 600 "$FILES_DIR/etc/dropbear/authorized_keys"
+	cat > "$FILES_DIR/etc/uci-defaults/96-fleet-ssh-key-only" <<'EOF'
+#!/bin/sh
+[ -s /etc/dropbear/authorized_keys ] || exit 0
+chmod 700 /etc/dropbear && chmod 600 /etc/dropbear/authorized_keys
+for s in $(uci -q show dropbear | sed -n 's/^dropbear\.\([^.=]*\)=dropbear$/\1/p'); do
+	uci set dropbear."$s".PasswordAuth='off'
+	uci set dropbear."$s".RootPasswordAuth='off'
+done
+uci commit dropbear
+exit 0
+EOF
+	echo "SSH 只认管理员公钥（$(printf '%s\n' "$SSH_KEYS" | grep -c '') 把）。"
+else
+	echo "ADMIN_SSH_PUBKEY 未设置：SSH 用 root 密码登录（只能经 Headscale 内网连）。"
+fi
+
 if [ -n "$ROOT_PW_HASH" ]; then
 	# 只接受 crypt 格式（$1$/$5$/$6$），避免写坏 /etc/shadow
 	if ! printf '%s' "$ROOT_PW_HASH" | grep -Eq '^\$(1|5|6)\$[A-Za-z0-9./]{1,16}\$[A-Za-z0-9./]{20,100}$'; then
@@ -285,7 +379,7 @@ if [ -n "$ROOT_PW_HASH" ]; then
 	} > "$FILES_DIR/etc/uci-defaults/95-root-password"
 	echo "root 默认密码已写入固件。"
 else
-	echo "ROOT_PW_HASH 未设置：root 保持无密码（局域网里的人能直接登录后台和终端）。"
+	echo "::warning::ROOT_PW_HASH 未设置：root 没有密码（家里打不开后台，但 Headscale 内网里的设备能直接登录）。"
 fi
 
 echo "fleet-agent 已写入固件。"

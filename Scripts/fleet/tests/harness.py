@@ -233,5 +233,5 @@ class AgentHarness:
 
     def set_uci(self, config, section, option, value):
         c = self.cursor
-        c.set(c, config, section, option, value)
+        c.set(c, config, section, option, self.to_lua(value))
         c.commit(c, config)

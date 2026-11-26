@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer"><title>上网设置</title>
+<style>
+:root{color-scheme:light dark;--line:#d0d4dc;--muted:#6b7280;--ok:#15803d;--warn:#b45309;--bad:#b91c1c;--acc:#2563eb}
+*{box-sizing:border-box}body{font:16px/1.55 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:0 auto;padding:12px;max-width:560px}
+h1{font-size:22px;margin:4px 0 2px}h2{font-size:17px;margin:0 0 8px}.muted{color:var(--muted)}.small{font-size:13px}
+.card{border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:12px 0}
+.code{font-size:26px;font-weight:700;letter-spacing:3px}
+.row{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px dashed var(--line)}.row:last-child{border-bottom:0}
+.row span:last-child{text-align:right}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+button{font:inherit;padding:9px 16px;border-radius:9px;border:1px solid var(--acc);background:var(--acc);color:#fff;cursor:pointer;margin:6px 6px 0 0}
+button.plain{background:transparent;color:inherit;border-color:var(--line)}button:disabled{opacity:.5}
+input,select{font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;width:100%;margin:4px 0 8px;background:transparent;color:inherit}
+label.radio{display:inline-flex;align-items:center;gap:4px;margin-right:14px}label.radio input{width:auto;margin:0}
+.qrs{display:flex;flex-wrap:wrap;gap:14px;justify-content:center}.qr{text-align:center}
+.qr img{width:200px;height:200px;object-fit:contain;border:1px solid var(--line);border-radius:10px;background:#fff}
+.paytext{white-space:pre-wrap;margin:8px 0}.note{background:rgba(180,83,9,.12);border-radius:8px;padding:8px 10px;margin:8px 0}
+.msg{margin-top:8px;font-weight:600}.hide{display:none}
+</style></head><body>
+<h1>上网设置</h1>
+<div>设备码 <span class="code" id="device">------</span></div>
+<div class="small muted">遇到问题联系客服时报这个设备码。完整后台只有客服能进。</div>
+
+<div class="card"><h2>状态</h2><div id="status" class="muted">读取中…</div></div>
+
+<div class="card hide" id="paycard"><h2>续费 / 开通</h2>
+<div class="paytext" id="paytext"></div>
+<div class="note">付款时请在备注里写设备码 <b id="paycode">------</b>，付完点下面对应的“我已付款”。确认收款后 1 分钟内自动恢复。</div>
+<div class="qrs" id="qrs"></div>
+<div class="msg" id="paymsg"></div>
+</div>
+
+<div class="card" id="logincard"><h2>宽带设置、手动升级</h2>
+<div class="small muted">用这台路由器的 WiFi 密码登录（路由器屏幕上显示的那串）。</div>
+<input type="password" id="pw" autocomplete="current-password" placeholder="WiFi 密码">
+<button id="loginbtn">登录</button><div class="msg" id="loginmsg"></div>
+</div>
+
+<div class="card hide" id="wancard"><h2>宽带设置</h2>
+<div class="small muted">光猫已经拨号的选“自动获取”；要路由器拨号的选“宽带拨号”，填运营商给的宽带账号和密码。</div>
+<div style="margin:8px 0">
+<label class="radio"><input type="radio" name="proto" value="dhcp">自动获取</label>
+<label class="radio"><input type="radio" name="proto" value="pppoe">宽带拨号</label>
+<label class="radio"><input type="radio" name="proto" value="static">静态 IP</label></div>
+<div id="f-pppoe" class="hide"><input id="ppp-user" placeholder="宽带账号" autocomplete="off">
+<input id="ppp-pass" type="password" placeholder="宽带密码" autocomplete="new-password"></div>
+<div id="f-static" class="hide"><input id="st-ip" placeholder="IP 地址，例如 100.64.10.20" inputmode="decimal">
+<input id="st-mask" placeholder="子网掩码，例如 255.255.255.0" inputmode="decimal">
+<input id="st-gw" placeholder="网关" inputmode="decimal"><input id="st-dns" placeholder="DNS（可以不填，多个用空格隔开）"></div>
+<button id="wansave">保存并重新连接</button><div class="msg" id="wanmsg"></div>
+</div>
+
+<div class="card hide" id="upcard"><h2>手动升级</h2>
+<div class="small muted">路由器连不上服务器、没法自动升级时用：选客服发给你的升级包（.tar 文件，不要解压），先上传校验，通过了再升级。只认我们签过名的固件。</div>
+<input type="file" id="upfile" accept=".tar,application/x-tar">
+<button id="upbtn">上传并校验</button><button id="flashbtn" class="hide">开始升级</button>
+<div class="msg" id="upmsg"></div>
+<button id="logout" class="plain">退出登录</button>
+</div>
+
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const STATUS={active:"正常",expired:"已到期：续费后 1 分钟内恢复",limited:"流量用完了",disabled:"已停用",pending:"还没开通：付款后开通",no_nodes:"暂时没有可用线路"};
+let token="";try{token=sessionStorage.getItem("fleet_setup")||""}catch(e){}
+function setToken(t){token=t||"";try{t?sessionStorage.setItem("fleet_setup",t):sessionStorage.removeItem("fleet_setup")}catch(e){}}
+async function api(action,opts){
+  opts=opts||{};const h={};if(token)h["Authorization"]="Bearer "+token;
+  let body;if(opts.file){h["Content-Type"]="application/octet-stream";body=opts.file}
+  else if(opts.json){h["Content-Type"]="application/json";body=JSON.stringify(opts.json)}
+  const r=await fetch("/cgi-bin/api?a="+action,{method:opts.method||(body?"POST":"GET"),headers:h,body:body,cache:"no-store"});
+  let j={};try{j=await r.json()}catch(e){}
+  if(r.status===401&&action!=="login"){setToken("");showLogin(true)}
+  return {ok:r.ok,status:r.status,body:j};
+}
+function row(name,value,cls){const d=document.createElement("div");d.className="row";const a=document.createElement("span");a.textContent=name;
+  const b=document.createElement("span");b.textContent=value;if(cls)b.className=cls;d.append(a,b);return d}
+function fmtDate(ts){const d=new Date(ts*1000);return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0")}
+function overseas(s){
+  if(s.status==="active"){if(s.chain==="down")return["故障：客服会尽快处理","bad"];if(s.chain==="noip")return["还没分配住宅 IP：请联系客服","warn"];return["正常","ok"]}
+  if(!s.status)return["还没和服务器同步","muted"];
+  return[STATUS[s.status]||s.status,s.status==="no_nodes"?"warn":"bad"];
+}
+function renderStatus(s){
+  $("device").textContent=s.device||"------";$("paycode").textContent=s.device||"------";
+  const box=$("status");box.replaceChildren();box.className="";
+  box.append(row("宽带（外网）",s.wan_up===true?"已连接":s.wan_up===false?"没连上：检查网线，或在下面改宽带设置":"-",s.wan_up===true?"ok":"bad"));
+  const o=overseas(s);box.append(row("海外网络",o[0],o[1]));
+  if(s.expire_at){const left=Math.ceil((s.expire_at*1000-Date.now())/86400000);
+    box.append(row("到期",fmtDate(s.expire_at)+(left>=0?"（还剩 "+left+" 天）":"（已过期）"),left<=7?"warn":""))}
+  if(s.tz)box.append(row("时区",(s.tz_zone?s.tz_zone.replace(/_/g," ")+"，":"")+s.tz+"：请把手机、电脑的时区改成这个",""));
+  box.append(row("管理通道",s.ts_up?"正常":"没连上",s.ts_up?"ok":"warn"));
+  if(s.ssid)box.append(row("WiFi 名字",s.ssid));
+  box.append(row("固件版本",s.firmware||"-"));
+  renderPay(s);
+  if(s.logged_in&&!$("wancard").dataset.on)showSettings();
+  if(!s.logged_in&&token){setToken("");showLogin(true)}
+}
+let payVersion=null;
+function renderPay(s){
+  const files=Array.isArray(s.pay_files)?s.pay_files:[];
+  if(!files.length&&!s.pay_text){$("paycard").classList.add("hide");return}
+  $("paycard").classList.remove("hide");
+  if(payVersion===s.pay_version)return;payVersion=s.pay_version;
+  $("paytext").textContent=s.pay_text||"";
+  const qrs=$("qrs");qrs.replaceChildren();
+  for(const name of files){
+    const ch=name.startsWith("alipay")?"alipay":"wechat";const label=ch==="alipay"?"支付宝":"微信";
+    const d=document.createElement("div");d.className="qr";
+    const img=document.createElement("img");img.alt=label+"收款码";img.src="/pay/"+encodeURIComponent(name)+"?v="+encodeURIComponent(s.pay_version||"");
+    const t=document.createElement("div");t.textContent=label+"扫码付款";
+    const b=document.createElement("button");b.textContent="我已用"+label+"付款";b.onclick=()=>paid(ch,b);
+    d.append(img,t,b);qrs.append(d);
+  }
+}
+async function paid(ch,btn){
+  if(!confirm("确认已经付款、并在备注里写了设备码？"))return;
+  btn.disabled=true;$("paymsg").textContent="正在通知客服…";
+  const r=await api("paid",{json:{channel:ch}});btn.disabled=false;
+  $("paymsg").className="msg "+(r.ok?"ok":"bad");
+  if(r.ok)$("paymsg").textContent=r.body.repeated?"刚才已经通知过了，请耐心等一下。":"已通知客服。确认收款后 1 分钟内自动恢复，不用一直点。";
+  else $("paymsg").textContent=r.body.error==="no_tailscale"?"路由器现在连不上服务器：先确认宽带能上网，或者直接联系客服并报设备码。":"通知没发出去，请稍后再试，或者直接联系客服。";
+}
+function showLogin(on){$("logincard").classList.toggle("hide",!on);for(const id of["wancard","upcard"]){$(id).classList.toggle("hide",on)}if(on)$("wancard").dataset.on=""}
+async function showSettings(){
+  showLogin(false);$("wancard").dataset.on="1";
+  const r=await api("wan");if(!r.ok)return;const w=r.body;
+  for(const el of document.querySelectorAll("input[name=proto]"))el.checked=el.value===w.proto;
+  $("ppp-user").value=w.username||"";$("ppp-pass").value="";$("ppp-pass").placeholder=w.has_password?"宽带密码（不改就留空）":"宽带密码";
+  $("st-ip").value=w.ipaddr||"";$("st-mask").value=w.netmask||"";$("st-gw").value=w.gateway||"";$("st-dns").value=(w.dns||[]).join(" ");
+  protoChanged();
+}
+function proto(){const el=document.querySelector("input[name=proto]:checked");return el?el.value:""}
+function protoChanged(){$("f-pppoe").classList.toggle("hide",proto()!=="pppoe");$("f-static").classList.toggle("hide",proto()!=="static")}
+for(const el of document.querySelectorAll("input[name=proto]"))el.onchange=protoChanged;
+$("loginbtn").onclick=async()=>{
+  const r=await api("login",{json:{password:$("pw").value}});$("pw").value="";
+  if(r.ok){setToken(r.body.token);$("loginmsg").textContent="";showSettings();return}
+  $("loginmsg").className="msg bad";
+  $("loginmsg").textContent=r.body.error==="locked"?"输错太多次，"+Math.ceil((r.body.wait||600)/60)+" 分钟后再试":r.body.error==="no_password"?"这台路由器还没设置 WiFi 密码，请联系客服":"密码不对";
+};
+$("pw").onkeydown=e=>{if(e.key==="Enter")$("loginbtn").click()};
+$("wansave").onclick=async()=>{
+  const p=proto();if(!p){alert("先选上网方式");return}
+  const data={proto:p};
+  if(p==="pppoe"){data.username=$("ppp-user").value.trim();data.password=$("ppp-pass").value}
+  if(p==="static"){data.ipaddr=$("st-ip").value.trim();data.netmask=$("st-mask").value.trim();data.gateway=$("st-gw").value.trim();data.dns=$("st-dns").value.trim().split(/[\s,，]+/).filter(Boolean)}
+  if(!confirm("保存后宽带会重新连接，大约断网 10~30 秒。继续？"))return;
+  const r=await api("wan",{json:data});$("wanmsg").className="msg "+(r.ok?"ok":"bad");
+  $("wanmsg").textContent=r.ok?"已保存，正在重新连接宽带。30 秒后看上面“宽带”一栏是不是已连接。":(r.body.message||"没保存成功");
+  if(r.ok)$("ppp-pass").value="";
+};
+$("upbtn").onclick=async()=>{
+  const f=$("upfile").files[0];if(!f){alert("先选升级包");return}
+  $("upbtn").disabled=true;$("flashbtn").classList.add("hide");$("upmsg").className="msg";$("upmsg").textContent="正在上传和校验，大约需要 1 分钟，别关页面…";
+  const r=await api("upload",{file:f});$("upbtn").disabled=false;
+  if(r.ok){$("upmsg").className="msg ok";$("upmsg").textContent="校验通过（"+(r.body.size/1048576).toFixed(1)+" MB）。点“开始升级”。";$("flashbtn").classList.remove("hide")}
+  else{$("upmsg").className="msg bad";$("upmsg").textContent=r.body.message||"上传失败，再试一次"}
+};
+$("flashbtn").onclick=async()=>{
+  if(!confirm("开始升级？大约 3~5 分钟，期间千万不要断电。升级完路由器会自动重启，WiFi 会断开一会儿，设置都会保留。"))return;
+  const r=await api("flash",{json:{}});
+  if(r.ok){$("flashbtn").classList.add("hide");$("upbtn").disabled=true;$("upmsg").className="msg warn";$("upmsg").textContent="正在升级，千万不要断电。5 分钟后重新连上 WiFi 再打开这个页面看固件版本。"}
+  else{$("upmsg").className="msg bad";$("upmsg").textContent=r.body.message||"没能开始升级"}
+};
+$("logout").onclick=async()=>{await api("logout",{json:{}});setToken("");showLogin(true)};
+async function refresh(){try{const r=await api("status");if(r.ok)renderStatus(r.body);else $("status").textContent="读取失败（"+r.status+"）"}catch(e){$("status").textContent="读取失败，刷新页面再试"}}
+refresh();setInterval(refresh,15000);
+</script></body></html>

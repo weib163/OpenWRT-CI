@@ -10,6 +10,9 @@
       "hs.example.com",
       "198.51.100.7"
     ],
+    "expire_at": 1798761600,
+    "global": false,
+    "has_residential": true,
     "nodes": [
       {
         "address": "203.0.113.10",
@@ -44,13 +47,34 @@
         "ws_path": "/ws-9f3k?ed=2048"
       }
     ],
-    "on_expire": "block",
+    "pay": {
+      "files": [
+        {
+          "name": "wechat.png",
+          "sha256": "641bcc6b072732423364f902409c56646466f613e24599d19ca7229b936f13cb",
+          "size": 72
+        },
+        {
+          "name": "alipay.jpg",
+          "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
+          "size": 68
+        }
+      ],
+      "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
+      "version": "82a27dea8756bac7"
+    },
     "refresh_seconds": 600,
-    "schema": 1,
+    "schema": 2,
     "status": "active",
-    "version": "11f5629486a72874"
+    "timezone": {
+      "label": "UTC-8",
+      "posix": "PST8PDT,M3.2.0,M11.1.0",
+      "zone": "America/Los_Angeles"
+    },
+    "udp": true,
+    "version": "dd9fc0bc69c24896"
   },
-  "chain": {
+  "active_global": {
     "auto": {
       "interval": "3m",
       "tolerance": 50,
@@ -60,6 +84,9 @@
       "hs.example.com",
       "198.51.100.7"
     ],
+    "expire_at": 1798761600,
+    "global": true,
+    "has_residential": true,
     "nodes": [
       {
         "address": "203.0.113.10",
@@ -94,20 +121,34 @@
         "ws_path": "/ws-9f3k?ed=2048"
       }
     ],
-    "on_expire": "block",
-    "refresh_seconds": 600,
-    "residential": {
-      "password": "s3cret:p@ss",
-      "port": 1080,
-      "server": "203.0.113.9",
-      "udp": true,
-      "username": "bob"
+    "pay": {
+      "files": [
+        {
+          "name": "wechat.png",
+          "sha256": "641bcc6b072732423364f902409c56646466f613e24599d19ca7229b936f13cb",
+          "size": 72
+        },
+        {
+          "name": "alipay.jpg",
+          "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
+          "size": 68
+        }
+      ],
+      "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
+      "version": "82a27dea8756bac7"
     },
-    "schema": 1,
+    "refresh_seconds": 600,
+    "schema": 2,
     "status": "active",
-    "version": "3a81831f391e5fb2"
+    "timezone": {
+      "label": "UTC-8",
+      "posix": "PST8PDT,M3.2.0,M11.1.0",
+      "zone": "America/Los_Angeles"
+    },
+    "udp": true,
+    "version": "30e756fbc5e20eca"
   },
-  "chain_ip_auth": {
+  "active_half_hour_tz": {
     "auto": {
       "interval": "3m",
       "tolerance": 50,
@@ -117,6 +158,8 @@
       "hs.example.com",
       "198.51.100.7"
     ],
+    "global": false,
+    "has_residential": true,
     "nodes": [
       {
         "address": "203.0.113.10",
@@ -151,18 +194,18 @@
         "ws_path": "/ws-9f3k?ed=2048"
       }
     ],
-    "on_expire": "block",
     "refresh_seconds": 600,
-    "residential": {
-      "port": 9000,
-      "server": "gw.example.com",
-      "udp": true
-    },
-    "schema": 1,
+    "schema": 2,
     "status": "active",
-    "version": "e210f9c23e06d5e9"
+    "timezone": {
+      "label": "UTC-3:30",
+      "posix": "NST3:30NDT,M3.2.0,M11.1.0",
+      "zone": "America/St_Johns"
+    },
+    "udp": true,
+    "version": "5b4856eb3499d525"
   },
-  "chain_no_udp": {
+  "active_no_udp": {
     "auto": {
       "interval": "3m",
       "tolerance": 50,
@@ -172,6 +215,9 @@
       "hs.example.com",
       "198.51.100.7"
     ],
+    "expire_at": 1798761600,
+    "global": false,
+    "has_residential": true,
     "nodes": [
       {
         "address": "203.0.113.10",
@@ -206,46 +252,280 @@
         "ws_path": "/ws-9f3k?ed=2048"
       }
     ],
-    "on_expire": "block",
-    "refresh_seconds": 600,
-    "residential": {
-      "password": "s3cret:p@ss",
-      "port": 1080,
-      "server": "203.0.113.9",
-      "udp": false,
-      "username": "bob"
+    "pay": {
+      "files": [
+        {
+          "name": "wechat.png",
+          "sha256": "641bcc6b072732423364f902409c56646466f613e24599d19ca7229b936f13cb",
+          "size": 72
+        },
+        {
+          "name": "alipay.jpg",
+          "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
+          "size": 68
+        }
+      ],
+      "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
+      "version": "82a27dea8756bac7"
     },
-    "schema": 1,
+    "refresh_seconds": 600,
+    "schema": 2,
     "status": "active",
-    "version": "1155e71a5906bcb1"
+    "timezone": {
+      "label": "UTC-8",
+      "posix": "PST8PDT,M3.2.0,M11.1.0",
+      "zone": "America/Los_Angeles"
+    },
+    "udp": false,
+    "version": "bd2603fce3f94058"
+  },
+  "active_plain": {
+    "auto": {
+      "interval": "3m",
+      "tolerance": 50,
+      "url": "https://www.gstatic.com/generate_204"
+    },
+    "direct": [
+      "hs.example.com",
+      "198.51.100.7"
+    ],
+    "global": false,
+    "has_residential": true,
+    "nodes": [
+      {
+        "address": "203.0.113.10",
+        "fingerprint": "chrome",
+        "flow": "xtls-rprx-vision",
+        "id": "haaaaaaaa11",
+        "port": 443,
+        "protocol": "vless",
+        "public_key": "Z84J2IelR9ch3k8VtlVhhs5ycBUlXA7wHBWcBrjqnAw",
+        "reality": true,
+        "remarks": "菲律宾1-REALITY",
+        "short_id": "a1b2c3d4",
+        "sni": "www.microsoft.com",
+        "tls": true,
+        "transport": "tcp",
+        "uuid": "3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90"
+      },
+      {
+        "address": "cdn.example.com",
+        "alpn": "h2,http/1.1",
+        "fingerprint": "chrome",
+        "id": "hbbbbbbbb22",
+        "port": 443,
+        "protocol": "vless",
+        "reality": false,
+        "remarks": "菲律宾1-CDN备用",
+        "sni": "cdn.example.com",
+        "tls": true,
+        "transport": "ws",
+        "uuid": "3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90",
+        "ws_host": "cdn.example.com",
+        "ws_path": "/ws-9f3k?ed=2048"
+      }
+    ],
+    "refresh_seconds": 600,
+    "schema": 2,
+    "status": "active",
+    "udp": true,
+    "version": "55aa55654f6af0f7"
   },
   "disabled": {
-    "on_expire": "block",
+    "direct": [
+      "hs.example.com",
+      "198.51.100.7"
+    ],
+    "pay": {
+      "files": [
+        {
+          "name": "wechat.png",
+          "sha256": "641bcc6b072732423364f902409c56646466f613e24599d19ca7229b936f13cb",
+          "size": 72
+        },
+        {
+          "name": "alipay.jpg",
+          "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
+          "size": 68
+        }
+      ],
+      "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
+      "version": "82a27dea8756bac7"
+    },
     "refresh_seconds": 600,
-    "schema": 1,
+    "schema": 2,
     "status": "disabled",
-    "version": "4e796cf4da6392b0"
+    "version": "202ccaa6a6f7b612"
   },
   "expired": {
-    "on_expire": "block",
+    "direct": [
+      "hs.example.com",
+      "198.51.100.7"
+    ],
+    "expire_at": 1798761600,
+    "pay": {
+      "files": [
+        {
+          "name": "wechat.png",
+          "sha256": "641bcc6b072732423364f902409c56646466f613e24599d19ca7229b936f13cb",
+          "size": 72
+        },
+        {
+          "name": "alipay.jpg",
+          "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
+          "size": 68
+        }
+      ],
+      "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
+      "version": "82a27dea8756bac7"
+    },
     "refresh_seconds": 600,
-    "schema": 1,
+    "schema": 2,
     "status": "expired",
-    "version": "7748a3260ba74471"
+    "timezone": {
+      "label": "UTC-8",
+      "posix": "PST8PDT,M3.2.0,M11.1.0",
+      "zone": "America/Los_Angeles"
+    },
+    "version": "4318af17fc9fac75"
   },
   "limited": {
-    "on_expire": "block",
+    "direct": [
+      "hs.example.com",
+      "198.51.100.7"
+    ],
+    "expire_at": 1798761600,
+    "pay": {
+      "files": [
+        {
+          "name": "wechat.png",
+          "sha256": "641bcc6b072732423364f902409c56646466f613e24599d19ca7229b936f13cb",
+          "size": 72
+        },
+        {
+          "name": "alipay.jpg",
+          "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
+          "size": 68
+        }
+      ],
+      "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
+      "version": "82a27dea8756bac7"
+    },
     "refresh_seconds": 600,
-    "schema": 1,
+    "schema": 2,
     "status": "limited",
-    "version": "8ef4d3411b2b1aae"
+    "timezone": {
+      "label": "UTC-8",
+      "posix": "PST8PDT,M3.2.0,M11.1.0",
+      "zone": "America/Los_Angeles"
+    },
+    "version": "d0e3f1db15d66fe0"
   },
   "no_nodes": {
-    "on_expire": "block",
+    "direct": [
+      "hs.example.com",
+      "198.51.100.7"
+    ],
+    "expire_at": 1798761600,
+    "pay": {
+      "files": [
+        {
+          "name": "wechat.png",
+          "sha256": "641bcc6b072732423364f902409c56646466f613e24599d19ca7229b936f13cb",
+          "size": 72
+        },
+        {
+          "name": "alipay.jpg",
+          "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
+          "size": 68
+        }
+      ],
+      "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
+      "version": "82a27dea8756bac7"
+    },
     "refresh_seconds": 600,
-    "schema": 1,
+    "schema": 2,
     "status": "no_nodes",
-    "version": "f48c5929e06799a8"
+    "timezone": {
+      "label": "UTC-8",
+      "posix": "PST8PDT,M3.2.0,M11.1.0",
+      "zone": "America/Los_Angeles"
+    },
+    "version": "f52097e2a97b931d"
+  },
+  "noip": {
+    "auto": {
+      "interval": "3m",
+      "tolerance": 50,
+      "url": "https://www.gstatic.com/generate_204"
+    },
+    "direct": [
+      "hs.example.com",
+      "198.51.100.7"
+    ],
+    "expire_at": 1798761600,
+    "global": false,
+    "has_residential": false,
+    "nodes": [
+      {
+        "address": "203.0.113.10",
+        "fingerprint": "chrome",
+        "flow": "xtls-rprx-vision",
+        "id": "haaaaaaaa11",
+        "port": 443,
+        "protocol": "vless",
+        "public_key": "Z84J2IelR9ch3k8VtlVhhs5ycBUlXA7wHBWcBrjqnAw",
+        "reality": true,
+        "remarks": "菲律宾1-REALITY",
+        "short_id": "a1b2c3d4",
+        "sni": "www.microsoft.com",
+        "tls": true,
+        "transport": "tcp",
+        "uuid": "3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90"
+      },
+      {
+        "address": "cdn.example.com",
+        "alpn": "h2,http/1.1",
+        "fingerprint": "chrome",
+        "id": "hbbbbbbbb22",
+        "port": 443,
+        "protocol": "vless",
+        "reality": false,
+        "remarks": "菲律宾1-CDN备用",
+        "sni": "cdn.example.com",
+        "tls": true,
+        "transport": "ws",
+        "uuid": "3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90",
+        "ws_host": "cdn.example.com",
+        "ws_path": "/ws-9f3k?ed=2048"
+      }
+    ],
+    "pay": {
+      "files": [
+        {
+          "name": "wechat.png",
+          "sha256": "641bcc6b072732423364f902409c56646466f613e24599d19ca7229b936f13cb",
+          "size": 72
+        },
+        {
+          "name": "alipay.jpg",
+          "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
+          "size": 68
+        }
+      ],
+      "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
+      "version": "82a27dea8756bac7"
+    },
+    "refresh_seconds": 600,
+    "schema": 2,
+    "status": "active",
+    "timezone": {
+      "label": "UTC-8",
+      "posix": "PST8PDT,M3.2.0,M11.1.0",
+      "zone": "America/Los_Angeles"
+    },
+    "udp": true,
+    "version": "28fb3a9779dd9be2"
   },
   "notice": {
     "auto": {
@@ -257,6 +537,9 @@
       "hs.example.com",
       "198.51.100.7"
     ],
+    "expire_at": 1798761600,
+    "global": false,
+    "has_residential": true,
     "nodes": [
       {
         "address": "203.0.113.10",
@@ -292,11 +575,32 @@
       }
     ],
     "notice": "PAY BY 12-01",
-    "on_expire": "block",
+    "pay": {
+      "files": [
+        {
+          "name": "wechat.png",
+          "sha256": "641bcc6b072732423364f902409c56646466f613e24599d19ca7229b936f13cb",
+          "size": 72
+        },
+        {
+          "name": "alipay.jpg",
+          "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
+          "size": 68
+        }
+      ],
+      "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
+      "version": "82a27dea8756bac7"
+    },
     "refresh_seconds": 600,
-    "schema": 1,
+    "schema": 2,
     "status": "active",
-    "version": "a97bf1c6608f21c4"
+    "timezone": {
+      "label": "UTC-8",
+      "posix": "PST8PDT,M3.2.0,M11.1.0",
+      "zone": "America/Los_Angeles"
+    },
+    "udp": true,
+    "version": "ae5eacd9e7f05b55"
   },
   "ota": {
     "board": "jdcloud,re-cs-02",
@@ -306,19 +610,42 @@
     "url": "/ota/26.11.24-01.23.45/ipq60xx-jdcloud_re-cs-02-squashfs-sysupgrade-v1.2.0-VIKINGYFY-main-WIFI-NO-26.11.24-01.23.45.bin",
     "version": "26.11.24-01.23.45"
   },
+  "pay_images": {
+    "alipay.jpg": "/9j/4GFsaXBheS1xci1zYW1wbGVhbGlwYXktcXItc2FtcGxlYWxpcGF5LXFyLXNhbXBsZWFsaXBheS1xci1zYW1wbGU=",
+    "wechat.png": "iVBORw0KGgp3ZWNoYXQtcXItc2FtcGxld2VjaGF0LXFyLXNhbXBsZXdlY2hhdC1xci1zYW1wbGV3ZWNoYXQtcXItc2FtcGxl"
+  },
   "pending": {
-    "on_expire": "block",
+    "direct": [
+      "hs.example.com",
+      "198.51.100.7"
+    ],
+    "pay": {
+      "files": [
+        {
+          "name": "wechat.png",
+          "sha256": "641bcc6b072732423364f902409c56646466f613e24599d19ca7229b936f13cb",
+          "size": 72
+        },
+        {
+          "name": "alipay.jpg",
+          "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
+          "size": 68
+        }
+      ],
+      "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
+      "version": "82a27dea8756bac7"
+    },
     "refresh_seconds": 600,
-    "schema": 1,
+    "schema": 2,
     "status": "pending",
-    "version": "98222d473c5c3466"
+    "version": "d8348e9855846478"
   },
   "public_key": "Z84J2IelR9ch3k8VtlVhhs5ycBUlXA7wHBWcBrjqnAw",
   "unchanged": {
     "refresh_seconds": 600,
-    "schema": 1,
+    "schema": 2,
     "status": "unchanged",
-    "version": "11f5629486a72874"
+    "version": "dd9fc0bc69c24896"
   },
   "vless_id": "3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90"
 }

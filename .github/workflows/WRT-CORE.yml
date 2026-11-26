@@ -202,6 +202,7 @@ jobs:
           ROOT_PW_HASH: ${{secrets.ROOT_PW_HASH}}
           WIFI_SEED: ${{secrets.WIFI_SEED}}
           FW_SIGN_PUBKEY: ${{vars.FW_SIGN_PUBKEY}}
+          ADMIN_SSH_PUBKEY: ${{vars.ADMIN_SSH_PUBKEY}}
         run: |
           cd ./wrt/
 
@@ -234,6 +235,11 @@ jobs:
             exit 1
           fi
           grep -q '^CONFIG_PACKAGE_sing-box=y' .config || { echo "::error::.config 里没有 sing-box"; exit 1; }
+          # 不要 UPnP：家里设备会借它在路由器上开端口，绕开代理直接收外网连接（暴露真实 IP）
+          if grep -qE '^CONFIG_PACKAGE_(miniupnpd|miniupnpd-nftables|miniupnpd-iptables|luci-app-upnp)=y' .config; then
+            echo "::error::.config 里还有 UPnP（miniupnpd / luci-app-upnp），在 Config/PRIVATE.txt 里关掉"
+            exit 1
+          fi
 
       - name: Prepare Rust Toolchain
         if: ${{ !inputs.WRT_TEST }}
@@ -358,6 +364,19 @@ jobs:
           done
           shred -u /tmp/fw-sign.sec 2>/dev/null || rm -f /tmp/fw-sign.sec
           echo "已签名 $COUNT 个升级包。"
+
+          # 手动升级包：路由器连不上服务器时，客户在“上网设置”页（http://192.168.10.1）上传它。
+          # 里面就是固件和签名两个文件，路由器用自带的公钥验签，不是我们签的不让刷
+          for FILE in *sysupgrade*.bin; do
+            [ -f "$FILE.sig" ] || continue
+            PKG="${FILE%.bin}-manual-upgrade.tar"
+            rm -rf /tmp/manual && mkdir /tmp/manual
+            cp "$FILE" /tmp/manual/firmware.bin
+            cp "$FILE.sig" /tmp/manual/firmware.bin.sig
+            tar --format=ustar --owner=0 --group=0 --numeric-owner -C /tmp/manual -cf "$PKG" firmware.bin firmware.bin.sig
+            rm -rf /tmp/manual
+            echo "手动升级包：$PKG"
+          done
           echo "WRT_SIGN=是（$COUNT 个升级包）" >> $GITHUB_ENV
 
       - name: Encrypt Firmware
@@ -410,8 +429,10 @@ jobs:
             配置：${{env.WRT_CONFIG}}
             平台：${{env.WRT_TARGET}}
 
-            登录地址：${{env.WRT_IP}}
+            家里打开：http://${{env.WRT_IP}}（上网设置页：状态、续费收款码、宽带拨号设置、手动升级；用 WiFi 密码登录）
+            完整后台（LuCI）、SSH、网页终端：只能经 Headscale 内网打开，家里打不开
             登录密码：${{env.WRT_PW}}
+            手动升级包：文件名带 manual-upgrade.tar 的那个，发给连不上服务器的客户，在上网设置页上传（不要解压）
 
             WIFI名称：${{env.WRT_SSID}}-设备码（屏幕上的 6 位编号）
             WIFI密码：每台不同，看路由器屏幕或管理页（从老固件升级上来的保持原来的）

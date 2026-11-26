@@ -2,7 +2,7 @@
 
 用法：python3 check_configs.py <sing-box 程序> [国内名单目录]
 不给名单目录就从 SagerNet 下载 geosite-cn.srs / geoip-cn.srs（和固件编译时一样）。
-每种情况（正常走链路、关 UDP、IP 白名单认证、没填住宅 IP、到期、停用、第一次开机）都生成一份配置，
+每种情况（正常、关 UDP、全部走 VPN、没分配住宅 IP、到期、停用、第一次开机）都生成一份配置，
 逐个执行 sing-box check，有一份不通过就失败。
 """
 
@@ -20,8 +20,8 @@ RULES = {
     "geosite-cn": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
     "geoip-cn": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
 }
-CASES = ("chain", "chain_no_udp", "chain_ip_auth", "active", "pending", "expired", "limited", "no_nodes",
-         "disabled", "notice")
+CASES = ("active", "active_no_udp", "active_global", "noip", "active_plain", "pending", "expired", "limited",
+         "no_nodes", "disabled", "notice")
 
 
 def main():

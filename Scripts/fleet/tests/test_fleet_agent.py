@@ -5,9 +5,12 @@
 需要：pip install lupa
 """
 
+import base64
 import copy
+import hashlib
 import json
 import os
+import re
 import sys
 import unittest
 
@@ -35,9 +38,17 @@ class ValidateTests(unittest.TestCase):
         py = self.h.to_py(cfg)
         self.assertEqual(len(py["nodes"]), 2)
         self.assertEqual(py["direct"], ["hs.example.com", "198.51.100.7"])
-        for name in ("pending", "expired", "limited", "disabled", "no_nodes", "unchanged", "chain", "chain_no_udp",
-                     "chain_ip_auth"):
+        self.assertEqual((py["udp"], py["global"], py["has_residential"], py["expire_at"]), (True, False, True, 1798761600))
+        self.assertEqual(py["timezone"], {"zone": "America/Los_Angeles", "posix": "PST8PDT,M3.2.0,M11.1.0", "label": "UTC-8"})
+        self.assertEqual([f["name"] for f in py["pay"]["files"]], ["wechat.png", "alipay.jpg"])
+        for name in ("pending", "expired", "limited", "disabled", "no_nodes", "unchanged", "active_no_udp",
+                     "active_global", "noip", "active_plain", "active_half_hour_tz", "notice"):
             self.assertIsNotNone(self.h.validate(resp(name))[0], name)
+        # 到期、待开通的回复也带收款码、到期时间、时区（客户最需要看到收款码）
+        exp = self.h.to_py(self.h.validate(resp("expired"))[0])
+        self.assertEqual((exp["expire_at"], exp["timezone"]["zone"], len(exp["pay"]["files"])),
+                         (1798761600, "America/Los_Angeles", 2))
+        self.assertEqual(len(self.h.to_py(self.h.validate(resp("pending"))[0])["pay"]["files"]), 2)
 
     def test_rejects_bad_or_malicious_fields(self):
         good = resp("active")
@@ -55,35 +66,55 @@ class ValidateTests(unittest.TestCase):
         bad_ws = copy.deepcopy(good)
         bad_ws["nodes"][1]["ws_path"] = "/a b'"
         self.assertIsNone(self.h.validate(bad_ws)[0])
-        for top in ({"status": "hacked"}, {"status": "active", "on_expire": "sometimes", "nodes": good["nodes"]},
+        for top in ({"status": "hacked"}, {"status": "active", "udp": "yes", "nodes": good["nodes"]},
                     {"status": "active", "nodes": []}, {"status": "active", "version": "zz!", "nodes": good["nodes"]},
-                    dict(good, direct=["ok.com", "bad entry"]), dict(good, auto={"url": "file:///etc/shadow"})):
+                    dict(good, direct=["ok.com", "bad entry"]), dict(good, auto={"url": "file:///etc/shadow"}),
+                    dict(good, has_residential=1), dict(good, **{"global": "true"}), dict(good, expire_at=-5)):
             self.assertIsNone(self.h.validate(top)[0], str(top)[:80])
 
-    def test_residential_validation(self):
-        good = resp("chain")
-        cfg, err = self.h.validate(good)
-        self.assertEqual(self.h.to_py(cfg)["residential"], good["residential"])
-        no_auth = self.h.to_py(self.h.validate(resp("chain_ip_auth"))[0])["residential"]
-        self.assertEqual(no_auth, {"server": "gw.example.com", "port": 9000, "udp": True})
-        for key, value in (("server", "2001:db8::1"), ("server", "a b"), ("port", 0), ("port", "1080x"),
-                           ("username", "x" * 200), ("password", "line\nbreak"), ("udp", "yes"), ("password", None)):
+    def test_timezone_and_pay_validation(self):
+        good = resp("active")
+        bad_tz = [("zone", "America/New York"), ("zone", "a;reboot"), ("zone", "../../etc/passwd"), ("zone", "x" * 50),
+                  ("posix", "PST8PDT; reboot"), ("posix", "EST5EDT\n"), ("posix", ""), ("label", "utc-8"),
+                  ("label", "UTC-8 SET"), ("zone", None)]
+        for key, value in bad_tz:
             r = copy.deepcopy(good)
             if value is None:
-                del r["residential"][key]
+                del r["timezone"][key]
             else:
-                r["residential"][key] = value
-            self.assertIsNone(self.h.validate(r)[0], "%s=%r 应该被拒绝" % (key, value))
+                r["timezone"][key] = value
+            self.assertIsNone(self.h.validate(r)[0], "timezone.%s=%r 应该被拒绝" % (key, value))
+        bad_pay = [("version", "XYZ"), ("version", ""), ("text", "a\x01b"), ("text", "x" * 1501), ("files", "a.png"),
+                   ("files", [{"name": "x.png", "sha256": "0" * 64, "size": 1}] * 5)]
+        for key, value in bad_pay:
+            r = copy.deepcopy(good)
+            r["pay"][key] = value
+            self.assertIsNone(self.h.validate(r)[0], "pay.%s=%r 应该被拒绝" % (key, str(value)[:30]))
+        for key, value in (("name", "../shadow.png"), ("name", "qr.gif"), ("name", "a b.png"), ("sha256", "abc"),
+                           ("size", 0), ("size", 2 * 1024 * 1024), ("size", "big")):
+            r = copy.deepcopy(good)
+            r["pay"]["files"][0][key] = value
+            self.assertIsNone(self.h.validate(r)[0], "pay.files.%s=%r 应该被拒绝" % (key, value))
+        # 说明文字可以换行，中文按字节算
+        r = copy.deepcopy(good)
+        r["pay"]["text"] = "第一行\n第二行" * 40
+        self.assertIsNotNone(self.h.validate(r)[0])
+        half = self.h.to_py(self.h.validate(resp("active_half_hour_tz"))[0])["timezone"]
+        self.assertEqual(half["label"], "UTC-3:30")
         # 校验后的结果再校验一次也要通过（last.json 存的就是它）
-        again = self.h.M.validate(cfg)
-        self.assertIsNotNone(again)
+        cfg, _ = self.h.validate(good)
+        self.assertEqual(self.h.to_py(self.h.M.validate(cfg)), self.h.to_py(cfg))
 
-    def test_old_server_on_expire_direct_is_ignored(self):
-        old = dict(resp("expired"), on_expire="direct")
+    def test_old_residential_field_is_ignored(self):
+        old = dict(resp("active"), residential={"server": "203.0.113.9", "port": 1080, "username": "bob",
+                                                 "password": "s3cret", "udp": True}, on_expire="direct")
         cfg, err = self.h.validate(old)
         self.assertIsNotNone(cfg, err)
+        self.assertNotIn("residential", self.h.to_py(cfg))
         self.h.handle(old)
-        self.assertEqual(self.h.proxy()["route"]["rules"][-1], {"action": "reject"})  # 照样海外断开
+        text = self.h.files["/etc/fleet/proxy.json"]
+        self.assertNotIn("s3cret", text)  # 住宅 IP 的账号密码绝不进路由器
+        self.assertNotIn('"socks"', text)
 
     def test_long_interval_is_capped(self):
         r = resp("active")
@@ -136,9 +167,9 @@ class ProxyTests(unittest.TestCase):
     def handle(self, name, state=None):
         return self.h.to_py(self.h.handle(resp(name), state))
 
-    def test_chain(self):
-        res = self.handle("chain")
-        self.assertEqual((res["mode"], res["proxy"]), ("chain", True))
+    def test_vpn(self):
+        res = self.handle("active")
+        self.assertEqual((res["mode"], res["proxy"]), ("vpn", True))
         conf = self.h.proxy()
         tun = conf["inbounds"][0]
         self.assertEqual((tun["type"], tun["auto_route"], tun["auto_redirect"], tun["include_interface"]),
@@ -159,13 +190,12 @@ class ProxyTests(unittest.TestCase):
         vpn = outbound(conf, "vpn")
         self.assertEqual((vpn["type"], vpn["outbounds"], vpn["interval"]),
                          ("urltest", ["node_haaaaaaaa11", "node_hbbbbbbbb22"], "3m"))
-        res_out = outbound(conf, "residential")
-        self.assertEqual(res_out, {"type": "socks", "tag": "residential", "version": "5", "server": "203.0.113.9",
-                                   "server_port": 1080, "username": "bob", "password": "s3cret:p@ss",
-                                   "detour": "vpn"})
+        # 住宅 IP 在服务器上转：路由器里没有 SOCKS 出站、没有住宅 IP 的账号密码
+        self.assertEqual([o["type"] for o in conf["outbounds"]], ["direct", "vless", "vless", "urltest"])
         route = conf["route"]
-        self.assertEqual(route["final"], "residential")  # 海外只有这一条路，没有直连
+        self.assertEqual(route["final"], "vpn")  # 海外只有这一条路，没有直连
         self.assertNotIn({"action": "reject"}, route["rules"])
+        self.assertIn({"ip_cidr": ["::/0"], "action": "reject"}, route["rules"])  # IPv6 一律不走
         self.assertIn({"rule_set": ["geosite-cn", "geoip-cn"], "action": "route", "outbound": "direct"}, route["rules"])
         self.assertIn({"domain_suffix": ["hs.example.com"], "action": "route", "outbound": "direct"}, route["rules"])
         self.assertIn({"ip_cidr": ["198.51.100.7"], "action": "route", "outbound": "direct"}, route["rules"])
@@ -174,71 +204,76 @@ class ProxyTests(unittest.TestCase):
         dns = conf["dns"]
         self.assertEqual((dns["final"], dns["strategy"]), ("remote", "ipv4_only"))
         remote = [x for x in dns["servers"] if x["tag"] == "remote"][0]
-        self.assertEqual((remote["type"], remote["server"], remote["detour"]), ("https", "1.1.1.1", "residential"))  # 海外域名经住宅 IP 用 DoH 去查
+        # 海外域名经 VPN 用 DoH 去查：服务器把它和数据一起转到住宅 IP
+        self.assertEqual((remote["type"], remote["server"], remote["detour"]), ("https", "1.1.1.1", "vpn"))
         self.assertIn({"rule_set": ["geosite-cn"], "action": "route", "server": "local"}, dns["rules"])
         self.assertTrue(any(i["tag"] == "probe-in" and i["listen"] == "127.0.0.1" for i in conf["inbounds"]))
-        # 配置里有密码：写完只给 root 读
+        # 配置里有 VLESS 的 UUID：写完只给 root 读
         self.assertIn("chmod 600 /etc/fleet/proxy.json", self.h.commands)
         self.assertTrue(any(c.startswith("sing-box check -c /etc/fleet/proxy.json.new") for c in self.h.commands))
 
     def test_udp_switch(self):
-        self.handle("chain")
+        self.handle("active")
         self.assertNotIn({"network": ["udp"], "action": "reject"}, self.h.proxy()["route"]["rules"])
-        self.handle("chain_no_udp")
-        conf = self.h.proxy()
-        self.assertEqual(conf["route"]["rules"][-1], {"network": ["udp"], "action": "reject"})
-        self.assertEqual(outbound(conf, "residential")["network"], "tcp")
+        self.handle("active_no_udp")
+        self.assertEqual(self.h.proxy()["route"]["rules"][-1], {"network": ["udp"], "action": "reject"})
 
-    def test_ip_whitelist_residential_has_no_credentials(self):
-        self.handle("chain_ip_auth")
-        r = outbound(self.h.proxy(), "residential")
-        self.assertNotIn("username", r)
-        self.assertEqual((r["server"], r["server_port"]), ("gw.example.com", 9000))
+    def test_global_mode_sends_china_through_vpn_too(self):
+        self.handle("active_global")
+        conf = self.h.proxy()
+        self.assertNotIn("rule_set", conf["route"])
+        self.assertFalse([r for r in conf["route"]["rules"] if "rule_set" in r])
+        self.assertFalse([r for r in conf["dns"]["rules"] if "rule_set" in r])
+        self.assertEqual(conf["route"]["final"], "vpn")
+        # 管理通道照样直连
+        self.assertIn({"domain_suffix": ["hs.example.com"], "action": "route", "outbound": "direct"}, conf["route"]["rules"])
 
     def test_no_residential_or_not_active_blocks_overseas(self):
-        for name in ("active", "pending", "expired", "limited", "no_nodes", "disabled"):
+        for name in ("noip", "pending", "expired", "limited", "no_nodes", "disabled"):
             h = AgentHarness()
             res = h.to_py(h.handle(resp(name)))
             conf = h.proxy()
-            self.assertEqual(res["mode"], "noip" if name == "active" else "block", name)
+            self.assertEqual(res["mode"], "noip" if name == "noip" else "block", name)
             self.assertEqual(conf["route"]["rules"][-1], {"action": "reject"}, name)
             self.assertEqual(conf["dns"]["final"], "local", name)
             self.assertEqual([o["type"] for o in conf["outbounds"]], ["direct"], name)  # 没有节点、没有 UUID
+            self.assertNotIn(FX["vless_id"], h.files["/etc/fleet/proxy.json"], name)
             self.assertIn({"rule_set": ["geosite-cn", "geoip-cn"], "action": "route", "outbound": "direct"},
                           conf["route"]["rules"])  # 国内照常
+            self.assertIn({"domain_suffix": ["hs.example.com"], "action": "route", "outbound": "direct"},
+                          conf["route"]["rules"])  # 管理通道照样直连
 
-    def test_expired_keeps_last_config_disabled_deletes_it(self):
-        self.handle("chain")
-        self.handle("expired")
-        self.assertIn("/etc/fleet/last.json", self.h.files)  # 续费后服务器一启用就恢复
-        self.assertIn({"domain_suffix": ["hs.example.com"], "action": "route", "outbound": "direct"},
-                      self.h.proxy()["route"]["rules"])  # 管理通道照样直连
-        self.handle("disabled")
-        self.assertNotIn("/etc/fleet/last.json", self.h.files)
-        self.assertNotIn(FX["vless_id"], self.h.files["/etc/fleet/proxy.json"])
+    def test_expired_or_disabled_drops_nodes_and_uuid(self):
+        self.handle("active")
+        for name in ("expired", "disabled"):
+            self.handle(name)
+            self.assertNotIn(FX["vless_id"], self.h.files["/etc/fleet/last.json"], name)
+            self.assertNotIn(FX["vless_id"], self.h.files["/etc/fleet/proxy.json"], name)
+            self.handle("active")
+            self.assertIn(FX["vless_id"], self.h.files["/etc/fleet/proxy.json"])  # 续费后马上恢复
 
     def test_same_config_twice_does_not_write_flash(self):
-        self.assertTrue(self.handle("chain")["proxy"])
+        self.assertTrue(self.handle("active")["proxy"])
         writes = [c for c in self.h.commands if c.startswith("sing-box check")]
-        res = self.handle("chain")
+        res = self.handle("active")
         self.assertFalse(res["proxy"])
         self.assertFalse(res["dns"])
         self.assertEqual([c for c in self.h.commands if c.startswith("sing-box check")], writes)
 
     def test_check_failure_keeps_old_config(self):
-        self.handle("chain")
+        self.handle("active")
         before = self.h.files["/etc/fleet/proxy.json"]
         self.h.run_map["sing-box check"] = 1
-        res = self.handle("chain_no_udp")
+        res = self.handle("active_no_udp")
         self.assertEqual((res["proxy"], res["code"]), (False, "proxy_check"))
         self.assertEqual(self.h.files["/etc/fleet/proxy.json"], before)
         self.assertNotIn("/etc/fleet/proxy.json.new", self.h.files)
 
     def test_tampered_config_is_rewritten(self):
-        r = resp("chain")
+        r = resp("active")
         self.h.handle(r)
         good = self.h.files["/etc/fleet/proxy.json"]
-        self.h.files["/etc/fleet/proxy.json"] = good.replace('"residential"', '"direct"')
+        self.h.files["/etc/fleet/proxy.json"] = good.replace('"reject"', '"route"')
         state = {"version": r["version"], "status": "active"}
         self.assertTrue(self.handle("unchanged", state)["proxy"])
         self.assertEqual(self.h.files["/etc/fleet/proxy.json"], good)
@@ -251,12 +286,12 @@ class ProxyTests(unittest.TestCase):
 
     def test_missing_rule_files(self):
         del self.h.files["/usr/share/fleet/geoip-cn.srs"]
-        res = self.handle("chain")
+        res = self.handle("active")
         self.assertEqual(res["code"], "no_rules")
         self.assertNotIn("rule_set", self.h.proxy()["route"])
 
     def test_dns_points_to_sing_box_and_management_stays_direct(self):
-        res = self.handle("chain")
+        res = self.handle("active")
         self.assertTrue(res["dns"])
         d = self.h.uci_section("dhcp", "cfg01411c")
         self.assertEqual(d["noresolv"], "1")
@@ -266,7 +301,7 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(len(d["server"]), 1 + 3 * 2)
         # 有人改了 DNS：下一轮改回来
         self.h.set_uci("dhcp", "cfg01411c", "server", ["8.8.8.8"])
-        self.assertTrue(self.handle("chain")["dns"])
+        self.assertTrue(self.handle("active")["dns"])
         self.assertEqual(self.h.uci_section("dhcp", "cfg01411c")["server"][0], "127.0.0.1#1053")
 
     def test_proxy_init_first_boot(self):
@@ -284,12 +319,37 @@ class ProxyTests(unittest.TestCase):
         self.h.main("--proxy-init")
         self.assertNotEqual(self.h.files.get("/etc/fleet/proxy.json"), "{}")
 
-    def test_proxy_init_after_upgrade_restores_chain(self):
-        r = resp("chain")
+    def test_proxy_init_after_upgrade_restores_vpn(self):
+        r = resp("active")
         self.h.files["/etc/fleet/last.json"] = json.dumps(r)
         self.h.files["/etc/fleet/state.json"] = json.dumps({"status": "active", "version": r["version"]})
         self.h.main("--proxy-init")
-        self.assertEqual(self.h.proxy()["route"]["final"], "residential")
+        self.assertEqual(self.h.proxy()["route"]["final"], "vpn")
+
+    def test_timezone_follows_residential_ip(self):
+        self.h.set_uci("dhcp", "lan", "dhcp_option", ["6,192.168.10.1", '100,"CST-8"'])
+        res = self.handle("active")
+        self.assertTrue(res["tz"])
+        sysc = self.h.uci_section("system", "cfg01e48a")
+        # LuCI 的写法用空格；开机脚本找时区文件时换回下划线
+        self.assertEqual((sysc["zonename"], sysc["timezone"]), ("America/Los Angeles", "PST8PDT,M3.2.0,M11.1.0"))
+        self.assertIn("/etc/init.d/system reload >/dev/null 2>&1", self.h.commands)
+        # DHCP 选项 100（POSIX）、101（IANA 名）发给家里设备；别的选项保留，旧的 100 换掉
+        self.assertEqual(self.h.uci_section("dhcp", "lan")["dhcp_option"],
+                         ["6,192.168.10.1", '100,"PST8PDT,M3.2.0,M11.1.0"', '101,"America/Los_Angeles"'])
+        self.assertTrue(res["dns"])  # dnsmasq 要重启才会发新的选项
+        # 第二次一样：什么都不改
+        commits = self.h.cursor.commits
+        res = self.handle("active")
+        self.assertFalse(res["tz"])
+        self.assertFalse(res["dns"])
+        self.assertEqual(self.h.cursor.commits, commits)
+
+    def test_no_timezone_in_reply_leaves_system_alone(self):
+        self.handle("active_plain")
+        sysc = self.h.uci_section("system", "cfg01e48a")
+        self.assertNotIn("zonename", sysc)
+        self.assertNotIn("dhcp_option", self.h.uci_section("dhcp", "lan"))
 
     def test_json_is_stable_and_escaped(self):
         M = self.h.M
@@ -403,6 +463,34 @@ class RunTests(unittest.TestCase):
         self.h.exec_map["tailscale status --json"] = json.dumps(TS_STATUS)
         self.h.exec_map["tailscale version"] = "1.90.6\n  tailscale commit: abc\n"
         self.h.exec_map["echo $PPID"] = "1234\n"
+        # 收款码下载：图片内容只在 Python 这边（Lua 只看命令输出的大小和 sha256）
+        self.pay_images = {k: base64.b64decode(v) for k, v in FX["pay_images"].items()}
+        self.pay_downloads = []
+        self.h.run_map["uclient-fetch -q -T 30 -O '/tmp/fleet/pay/"] = self._pay_download
+        self.h.exec_map["wc -c < '/tmp/fleet/pay/"] = self._size_and_hash
+        self.h.run_map["mv -f '/tmp/fleet/pay/"] = self._mv
+
+    def _pay_download(self, cmd):
+        path, url = re.findall(r"'([^']*)'", cmd)[:2]
+        self.pay_downloads.append(url)
+        name = url.split("/v1/pay/")[1].split("?")[0]
+        if name not in self.pay_images:
+            return 1
+        self.h.files[path] = self.pay_images[name]
+        return 0
+
+    def _size_and_hash(self, cmd):
+        path = re.findall(r"'([^']*)'", cmd)[0]
+        data = self.h.files.get(path)
+        if data is None:
+            return ""
+        data = data if isinstance(data, bytes) else data.encode()
+        return "%d\n%s  %s\n" % (len(data), hashlib.sha256(data).hexdigest(), path)
+
+    def _mv(self, cmd):
+        src, dst = re.findall(r"'([^']*)'", cmd)[:2]
+        self.h.files[dst] = self.h.files.pop(src)
+        return 0
 
     def serve(self, body):
         def fetch(cmd):
@@ -417,19 +505,28 @@ class RunTests(unittest.TestCase):
         return {k: v[0] for k, v in parse_qs(urlsplit(self.last_url).query, keep_blank_values=True).items()}
 
     def test_full_run_reports_and_saves_state(self):
-        r = resp("chain")
+        r = resp("active")
         self.serve(r)
         self.assertEqual(self.h.main(), 0)
         self.assertTrue(self.last_url.startswith("http://100.64.0.9:8080/v1/config?"))
         q = self.query()
         self.assertEqual((q["ver"], q["fw"], q["build"], q["agent"], q["board"], q["ts"], q["pw"], q["err"], q["px"]),
-                         ("", FW_OLD, BUILD_OLD, "1.3.0", BOARD, "1.90.6", "1.14.4", "", ""))
+                         ("", FW_OLD, BUILD_OLD, "1.4.0", BOARD, "1.90.6", "1.14.4", "", ""))
         self.assertEqual((q["ws"], q["wk"]), ("OWRT", "12345678"))
         self.assertEqual(self.h.restarts, 1)
         self.assertEqual(self.h.dnsmasq_restarts, 1)
         state = json.loads(self.h.files["/etc/fleet/state.json"])
         self.assertEqual((state["version"], state["status"], state["chain"], state["egress"]),
                          (r["version"], "active", "ok", "203.0.113.50"))
+        # 到期时间、时区（刚设好：屏幕提醒 3 天）
+        self.assertEqual((state["expire_at"], state["tz_at"], state["tz_label"]), (1798761600, self.h.now, "UTC-8"))
+        self.assertEqual(self.h.screen_restarts, 1)  # 屏幕时钟跟着新时区
+        # 收款码下载到上网设置页
+        self.assertEqual(self.h.files["/www/fleet-setup/pay/wechat.png"], self.pay_images["wechat.png"])
+        self.assertEqual(self.h.files["/www/fleet-setup/pay/alipay.jpg"], self.pay_images["alipay.jpg"])
+        info = json.loads(self.h.files["/www/fleet-setup/pay/info.json"])
+        self.assertEqual((info["version"], info["files"]), (r["pay"]["version"], ["wechat.png", "alipay.jpg"]))
+        self.assertIn("付款时备注设备码", info["text"])
         self.assertTrue(any("出口 IP：203.0.113.50" in m for m in self.h.logs))
         r2 = copy.deepcopy(r)
         r2["status"] = "unchanged"
@@ -437,11 +534,65 @@ class RunTests(unittest.TestCase):
         self.h.main()
         q = self.query()
         self.assertEqual((q["ver"], q["px"], q["eg"]), (r["version"], "ok", "203.0.113.50"))
-        self.assertEqual((self.h.restarts, self.h.dnsmasq_restarts), (1, 1))
+        self.assertEqual((self.h.restarts, self.h.dnsmasq_restarts, self.h.screen_restarts), (1, 1, 1))
+        self.assertEqual(len(self.pay_downloads), 2)  # 收款码版本没变：不再下载
+        self.assertEqual(json.loads(self.h.files["/etc/fleet/state.json"])["tz_at"], self.h.now)
+
+    def test_pay_codes_follow_server(self):
+        r = resp("active")
+        self.serve(r)
+        self.h.main()
+        # 换了一张图：整批重下，旧的删掉
+        new_png = b"\x89PNG\r\n\x1a\n" + b"new-wechat" * 3
+        self.pay_images["wechat.png"] = new_png
+        r2 = copy.deepcopy(r)
+        r2["version"] = "1" * 16
+        r2["pay"]["version"] = "2" * 16
+        r2["pay"]["files"] = [{"name": "wechat.png", "sha256": hashlib.sha256(new_png).hexdigest(), "size": len(new_png)}]
+        self.serve(r2)
+        self.h.main()
+        self.assertEqual(self.h.files["/www/fleet-setup/pay/wechat.png"], new_png)
+        self.assertNotIn("/www/fleet-setup/pay/alipay.jpg", self.h.files)
+        # 下载的内容和清单对不上：不换，留着旧的
+        r3 = copy.deepcopy(r2)
+        r3["version"], r3["pay"]["version"] = "3" * 16, "4" * 16
+        r3["pay"]["files"][0]["sha256"] = "0" * 64
+        self.serve(r3)
+        self.h.main()
+        self.assertEqual(self.h.files["/www/fleet-setup/pay/wechat.png"], new_png)
+        self.assertEqual(json.loads(self.h.files["/www/fleet-setup/pay/info.json"])["version"], "2" * 16)
+        self.assertTrue(any("收款码没更新" in m for m in self.h.logs))
+        self.assertFalse([k for k in self.h.files if k.startswith("/tmp/fleet/pay/")])
+        # 服务器上删光了：路由器也删掉
+        r4 = copy.deepcopy(r)
+        r4["version"] = "5" * 16
+        del r4["pay"]
+        self.serve(r4)
+        self.h.main()
+        self.assertNotIn("/www/fleet-setup/pay/wechat.png", self.h.files)
+        self.assertFalse(json.loads(self.h.files["/www/fleet-setup/pay/info.json"])["files"])
+
+    def test_lost_last_config_keeps_pay_codes_and_expiry(self):
+        r = resp("active")
+        self.serve(r)
+        self.h.main()
+        del self.h.files["/etc/fleet/last.json"]  # 比如闪存出过问题
+        self.serve(resp("unchanged") | {"version": r["version"]})
+        self.h.main()
+        self.assertIn("/www/fleet-setup/pay/wechat.png", self.h.files)  # 收款码没被删
+        state = json.loads(self.h.files["/etc/fleet/state.json"])
+        self.assertEqual((state["expire_at"], state.get("version")), (1798761600, None))  # 下一轮要完整配置
+
+    def test_expired_still_gets_pay_codes(self):
+        self.serve(resp("expired"))
+        self.h.main()
+        self.assertIn("/www/fleet-setup/pay/wechat.png", self.h.files)
+        state = json.loads(self.h.files["/etc/fleet/state.json"])
+        self.assertEqual((state["status"], state["expire_at"]), ("expired", 1798761600))
 
     def test_chain_down_is_reported_and_shown(self):
         self.h.exec_map["socks5h://127.0.0.1:7891"] = ""
-        self.serve(resp("chain"))
+        self.serve(resp("active"))
         self.h.main()
         self.assertEqual(self.h.files.get("/etc/fleet/last_error"), "chain_down")
         state = json.loads(self.h.files["/etc/fleet/state.json"])
@@ -453,7 +604,7 @@ class RunTests(unittest.TestCase):
         self.assertNotIn("/etc/fleet/last_error", self.h.files)
 
     def test_no_residential_state(self):
-        self.serve(resp("active"))
+        self.serve(resp("noip"))
         self.h.main()
         state = json.loads(self.h.files["/etc/fleet/state.json"])
         self.assertEqual(state["chain"], "noip")
@@ -468,7 +619,7 @@ class RunTests(unittest.TestCase):
         self.assertEqual((self.query()["fw"], self.query()["build"]), ("r28000-abcdef", ""))
 
     def test_server_unreachable_keeps_config(self):
-        self.serve(resp("chain"))
+        self.serve(resp("active"))
         self.h.main()
         before = self.h.files["/etc/fleet/proxy.json"]
         self.serve(None)
@@ -488,7 +639,7 @@ class RunTests(unittest.TestCase):
 
     def test_apply_failure_is_reported(self):
         self.h.run_map["sing-box check"] = 1
-        self.serve(resp("chain"))
+        self.serve(resp("active"))
         self.h.main()
         self.assertEqual(self.h.files.get("/etc/fleet/last_error"), "proxy_check")
         self.assertEqual(self.h.restarts, 0)
@@ -521,6 +672,34 @@ class RunTests(unittest.TestCase):
 
     def test_url_quoting_is_safe(self):
         self.assertEqual(self.h.M.shell_quote("a'b"), "'a'\\''b'")
+
+    def test_paid_is_forwarded_to_server(self):
+        posted = []
+
+        def fetch(cmd):
+            posted.append(cmd)
+            return '{"ok": true}__FLEET_RC=0\n'
+        self.h.exec_map["uclient-fetch -q -T 10 --post-data="] = fetch
+        ok = self.h.M.paid("wechat")
+        self.assertTrue(ok)
+        self.assertIn("--post-data='ch=wechat'", posted[0])
+        self.assertIn("'http://100.64.0.9:8080/v1/paid'", posted[0])
+        # 不认识的渠道当空的发；乱写的东西进不了命令行
+        self.h.M.paid("x'; reboot")
+        self.assertIn("--post-data='ch='", posted[1])
+        # 管理通道断了：告诉页面
+        self.h.exec_map["tailscale status --json"] = json.dumps({"BackendState": "Stopped"})
+        res = self.h.M.paid("alipay")
+        self.assertEqual(res[1] if isinstance(res, tuple) else None, "no_tailscale")
+
+    def test_status_info_for_setup_page(self):
+        self.serve(resp("active"))
+        self.h.main()
+        info = self.h.to_py(self.h.M.status_info())
+        self.assertEqual((info["status"], info["chain"], info["expire_at"], info["tz"]), ("active", "ok", 1798761600, "UTC-8"))
+        self.assertEqual((info["pay_files"], info["ssid"]), (["wechat.png", "alipay.jpg"], "OWRT"))
+        self.assertEqual(info["device"], "4D5E6F")  # 拿不到设备名时用 br-lan 的 MAC
+        self.assertNotIn("12345678", json.dumps(info))  # 不带 WiFi 密码
 
 
 class OtaTests(RunTests):
@@ -682,7 +861,7 @@ class HealthTests(unittest.TestCase):
         self.h.exec_map["uclient-fetch"] = lambda cmd: json.dumps(self.body) + "__FLEET_RC=0\n"
 
     def fetches(self):
-        return [c for c in self.h.commands if "uclient-fetch" in c]
+        return [c for c in self.h.commands if "uclient-fetch" in c and "/v1/config" in c]
 
     def screen_cmds(self):
         return [c for c in self.h.commands if "nc 127.0.0.1" in c]
@@ -855,6 +1034,66 @@ class HealthTests(unittest.TestCase):
         self.h.now = 1800000000
         self.health()
         self.assertIn("'show 15 %s\\n' 'NO IP'", self.screen_cmds()[-1])
+
+    def test_expiry_and_timezone_reminders(self):
+        self.health()  # 第一次：填编号、重启屏幕程序
+        now = 1800000000
+        cases = [
+            ({"status": "active", "expire_at": now + 3 * 86400 - 100}, "EXP 3D"),
+            ({"status": "active", "expire_at": now + 3600}, "EXP 1D"),
+            ({"status": "active", "expire_at": now - 10}, "EXP TODAY"),  # 面板还没改成到期
+            ({"status": "active", "expire_at": now + 10 * 86400, "tz_at": now - 3600, "tz_label": "UTC-8"},
+             "TZ UTC-8 SET PHONE"),
+            ({"status": "active", "expire_at": now + 86400, "chain": "noip", "tz_at": now, "tz_label": "UTC-8"}, "EXP 1D"),
+            ({"status": "active", "chain": "noip", "tz_at": now, "tz_label": "UTC-8"}, "NO IP"),
+            ({"status": "active", "tz_at": now, "tz_label": "x'; reboot"}, "TZ CHANGED SET PHONE"),
+        ]
+        for state, text in cases:
+            self.h.files["/etc/fleet/state.json"] = json.dumps(state)
+            self.h.now = now
+            self.health()
+            self.assertIn("'show 15 %s\\n' '" + text + "'", self.screen_cmds()[-1], state)
+        # 时区提醒只显示 3 天；到期还远：不插播
+        self.h.files["/etc/fleet/state.json"] = json.dumps({"status": "active", "expire_at": now + 30 * 86400,
+                                                             "tz_at": now - 4 * 86400, "tz_label": "UTC-8"})
+        n = len(self.screen_cmds())
+        self.health()
+        self.assertEqual(len(self.screen_cmds()), n)
+
+    def test_net_down_shows_setup_page_address(self):
+        self.h.cursor.committed["network"] = self.h.to_lua([{".name": "lan", ".type": "interface", "ipaddr": "192.168.10.1"}])
+        self.h.cursor.staged["network"] = self.h.cursor.committed["network"]
+        self.health()
+        self.h.files["/proc/net/route"] = ROUTE_DOWN
+        self.health()
+        self.assertIn("'show 8 %s\\n' 'NET DOWN 192.168.10.1'", self.screen_cmds()[-1])
+
+    def test_ping_triggers_immediate_sync(self):
+        self.h.main("--now")
+        n = len(self.fetches())
+        answer = {"sync": False}
+        self.h.exec_map = dict({"/v1/ping?ver=": lambda cmd: json.dumps(answer) + "__FLEET_RC=0\n"}, **self.h.exec_map)
+        self.health()
+        self.assertEqual(len(self.fetches()), n)
+        self.assertTrue([c for c in self.h.commands if "/v1/ping?ver=" in c])
+        answer["sync"] = True  # 管理页刚续费
+        self.health()
+        self.assertEqual(len(self.fetches()), n + 1)
+
+    def test_setup_page_redirect_follows_lan_address(self):
+        c = self.h.cursor
+        for name, data in (("network", [{".name": "lan", ".type": "interface", "ipaddr": "192.168.2.1/24"}]),
+                           ("firewall", [{".name": "fleet_setup_redirect", ".type": "redirect", "src_dip": "192.168.10.1",
+                                          "src_dport": "80", "dest_port": "81"}])):
+            c.committed[name] = self.h.to_lua(data)
+            c.staged[name] = self.h.to_lua(data)
+        self.health()
+        fw = [x for x in self.h.uci("firewall") if x[".name"] == "fleet_setup_redirect"][0]
+        self.assertEqual(fw["src_dip"], "192.168.2.1")
+        self.assertIn("/etc/init.d/firewall reload >/dev/null 2>&1", self.h.commands)
+        n = self.h.commands.count("/etc/init.d/firewall reload >/dev/null 2>&1")
+        self.health()
+        self.assertEqual(self.h.commands.count("/etc/init.d/firewall reload >/dev/null 2>&1"), n)
 
     def test_proxy_watchdog(self):
         self.h.files["/etc/fleet/proxy.json"] = "{}"
