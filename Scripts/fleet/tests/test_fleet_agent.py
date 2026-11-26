@@ -35,7 +35,8 @@ class ValidateTests(unittest.TestCase):
         py = self.h.to_py(cfg)
         self.assertEqual(len(py["nodes"]), 2)
         self.assertEqual(py["direct"], ["hs.example.com", "198.51.100.7"])
-        for name in ("pending", "expired_block", "expired_direct", "limited", "disabled", "no_nodes", "unchanged"):
+        for name in ("pending", "expired", "limited", "disabled", "no_nodes", "unchanged", "chain", "chain_no_udp",
+                     "chain_ip_auth"):
             self.assertIsNotNone(self.h.validate(resp(name))[0], name)
 
     def test_rejects_bad_or_malicious_fields(self):
@@ -58,6 +59,31 @@ class ValidateTests(unittest.TestCase):
                     {"status": "active", "nodes": []}, {"status": "active", "version": "zz!", "nodes": good["nodes"]},
                     dict(good, direct=["ok.com", "bad entry"]), dict(good, auto={"url": "file:///etc/shadow"})):
             self.assertIsNone(self.h.validate(top)[0], str(top)[:80])
+
+    def test_residential_validation(self):
+        good = resp("chain")
+        cfg, err = self.h.validate(good)
+        self.assertEqual(self.h.to_py(cfg)["residential"], good["residential"])
+        no_auth = self.h.to_py(self.h.validate(resp("chain_ip_auth"))[0])["residential"]
+        self.assertEqual(no_auth, {"server": "gw.example.com", "port": 9000, "udp": True})
+        for key, value in (("server", "2001:db8::1"), ("server", "a b"), ("port", 0), ("port", "1080x"),
+                           ("username", "x" * 200), ("password", "line\nbreak"), ("udp", "yes"), ("password", None)):
+            r = copy.deepcopy(good)
+            if value is None:
+                del r["residential"][key]
+            else:
+                r["residential"][key] = value
+            self.assertIsNone(self.h.validate(r)[0], "%s=%r 应该被拒绝" % (key, value))
+        # 校验后的结果再校验一次也要通过（last.json 存的就是它）
+        again = self.h.M.validate(cfg)
+        self.assertIsNotNone(again)
+
+    def test_old_server_on_expire_direct_is_ignored(self):
+        old = dict(resp("expired"), on_expire="direct")
+        cfg, err = self.h.validate(old)
+        self.assertIsNotNone(cfg, err)
+        self.h.handle(old)
+        self.assertEqual(self.h.proxy()["route"]["rules"][-1], {"action": "reject"})  # 照样海外断开
 
     def test_long_interval_is_capped(self):
         r = resp("active")
@@ -97,104 +123,275 @@ class ValidateTests(unittest.TestCase):
         self.assertIsNone(self.vo(good, "")[0])
 
 
-class ApplyTests(unittest.TestCase):
+def outbound(conf, tag):
+    return [o for o in conf["outbounds"] if o["tag"] == tag][0]
+
+
+class ProxyTests(unittest.TestCase):
+    """生成的 sing-box 配置：链路、国内直连、断网保护、DNS。"""
+
     def setUp(self):
         self.h = AgentHarness()
 
-    def test_active_writes_passwall2_sections(self):
-        self.assertTrue(self.h.handle(resp("active")))
-        nodes = self.h.sections("nodes")
-        reality = nodes["fleet_haaaaaaaa11"]
-        self.assertEqual((reality["type"], reality["protocol"], reality["domain_strategy"]), ("sing-box", "vless", "ipv4_only"))
-        self.assertEqual((reality["tls"], reality["reality"], reality["reality_publicKey"], reality["reality_shortId"],
-                          reality["tls_serverName"], reality["flow"], reality["transport"], reality["port"]),
-                         ("1", "1", FX["public_key"], "a1b2c3d4", "www.microsoft.com", "xtls-rprx-vision", "tcp", "443"))
-        ws = nodes["fleet_hbbbbbbbb22"]
-        self.assertEqual((ws["transport"], ws["ws_path"], ws["ws_host"], ws["reality"], ws["alpn"]),
-                         ("ws", "/ws-9f3k?ed=2048", "cdn.example.com", "0", "h2,http/1.1"))
-        auto = nodes["fleet_auto"]
-        self.assertEqual(auto["protocol"], "_urltest")
-        self.assertEqual(auto["urltest_node"], ["fleet_haaaaaaaa11", "fleet_hbbbbbbbb22"])
-        shunt = nodes["fleet_shunt"]
-        self.assertEqual((shunt["protocol"], shunt["shunt_group"], shunt["CN"], shunt["default_node"],
-                          shunt["ProxyFront"], shunt["fleet_direct"]),
-                         ("_shunt", "CN", "_direct", "fleet_auto", "fleet_auto", "_direct"))
-        rule = self.h.sections("shunt_rules")["fleet_direct"]
-        self.assertEqual((rule["group"], rule["domain_list"], rule["ip_list"]),
-                         ("CN", "domain:hs.example.com", "198.51.100.7"))
-        g = self.h.global_opts()
-        self.assertEqual((g["node"], g["enabled"]), ("fleet_shunt", "1"))
-        self.assertIn("customer_node", nodes)
-        self.assertIn("examplenode", nodes)
-        self.assertIn("CN", self.h.sections("shunt_rules"))
+    def handle(self, name, state=None):
+        return self.h.to_py(self.h.handle(resp(name), state))
 
-    def test_ipv4_only_settings(self):
-        c = self.h.cursor
-        c.set(c, "passwall2", "cfg03", "ipv6_tproxy", "1")
-        c.commit(c, "passwall2")
-        self.h.handle(resp("active"))
-        g = self.h.global_opts()
-        self.assertEqual((g["direct_dns_query_strategy"], g["remote_dns_query_strategy"]), ("UseIPv4", "UseIPv4"))
-        self.assertEqual(self.h.section_of_type("global_forwarding")["ipv6_tproxy"], "0")
+    def test_chain(self):
+        res = self.handle("chain")
+        self.assertEqual((res["mode"], res["proxy"]), ("chain", True))
+        conf = self.h.proxy()
+        tun = conf["inbounds"][0]
+        self.assertEqual((tun["type"], tun["auto_route"], tun["auto_redirect"], tun["include_interface"]),
+                         ("tun", True, True, ["br-lan"]))
+        self.assertIn("100.64.0.0/10", tun["route_exclude_address"])  # Tailscale 不进代理
+        reality = outbound(conf, "node_haaaaaaaa11")
+        self.assertEqual((reality["server"], reality["server_port"], reality["uuid"], reality["flow"]),
+                         ("203.0.113.10", 443, FX["vless_id"], "xtls-rprx-vision"))
+        self.assertEqual(reality["tls"], {"enabled": True, "server_name": "www.microsoft.com",
+                                          "utls": {"enabled": True, "fingerprint": "chrome"},
+                                          "reality": {"enabled": True, "public_key": FX["public_key"],
+                                                      "short_id": "a1b2c3d4"}})
+        ws = outbound(conf, "node_hbbbbbbbb22")
+        self.assertEqual(ws["transport"], {"type": "ws", "path": "/ws-9f3k", "max_early_data": 2048,
+                                           "early_data_header_name": "Sec-WebSocket-Protocol",
+                                           "headers": {"Host": "cdn.example.com"}})
+        self.assertEqual(ws["tls"]["alpn"], ["http/1.1"])  # WebSocket 不能协商成 h2
+        vpn = outbound(conf, "vpn")
+        self.assertEqual((vpn["type"], vpn["outbounds"], vpn["interval"]),
+                         ("urltest", ["node_haaaaaaaa11", "node_hbbbbbbbb22"], "3m"))
+        res_out = outbound(conf, "residential")
+        self.assertEqual(res_out, {"type": "socks", "tag": "residential", "version": "5", "server": "203.0.113.9",
+                                   "server_port": 1080, "username": "bob", "password": "s3cret:p@ss",
+                                   "detour": "vpn"})
+        route = conf["route"]
+        self.assertEqual(route["final"], "residential")  # 海外只有这一条路，没有直连
+        self.assertNotIn({"action": "reject"}, route["rules"])
+        self.assertIn({"rule_set": ["geosite-cn", "geoip-cn"], "action": "route", "outbound": "direct"}, route["rules"])
+        self.assertIn({"domain_suffix": ["hs.example.com"], "action": "route", "outbound": "direct"}, route["rules"])
+        self.assertIn({"ip_cidr": ["198.51.100.7"], "action": "route", "outbound": "direct"}, route["rules"])
+        self.assertEqual([r["path"] for r in route["rule_set"]],
+                         ["/usr/share/fleet/geosite-cn.srs", "/usr/share/fleet/geoip-cn.srs"])
+        dns = conf["dns"]
+        self.assertEqual((dns["final"], dns["strategy"]), ("remote", "ipv4_only"))
+        remote = [x for x in dns["servers"] if x["tag"] == "remote"][0]
+        self.assertEqual((remote["type"], remote["server"], remote["detour"]), ("https", "1.1.1.1", "residential"))  # 海外域名经住宅 IP 用 DoH 去查
+        self.assertIn({"rule_set": ["geosite-cn"], "action": "route", "server": "local"}, dns["rules"])
+        self.assertTrue(any(i["tag"] == "probe-in" and i["listen"] == "127.0.0.1" for i in conf["inbounds"]))
+        # 配置里有密码：写完只给 root 读
+        self.assertIn("chmod 600 /etc/fleet/proxy.json", self.h.commands)
+        self.assertTrue(any(c.startswith("sing-box check -c /etc/fleet/proxy.json.new") for c in self.h.commands))
+
+    def test_udp_switch(self):
+        self.handle("chain")
+        self.assertNotIn({"network": ["udp"], "action": "reject"}, self.h.proxy()["route"]["rules"])
+        self.handle("chain_no_udp")
+        conf = self.h.proxy()
+        self.assertEqual(conf["route"]["rules"][-1], {"network": ["udp"], "action": "reject"})
+        self.assertEqual(outbound(conf, "residential")["network"], "tcp")
+
+    def test_ip_whitelist_residential_has_no_credentials(self):
+        self.handle("chain_ip_auth")
+        r = outbound(self.h.proxy(), "residential")
+        self.assertNotIn("username", r)
+        self.assertEqual((r["server"], r["server_port"]), ("gw.example.com", 9000))
+
+    def test_no_residential_or_not_active_blocks_overseas(self):
+        for name in ("active", "pending", "expired", "limited", "no_nodes", "disabled"):
+            h = AgentHarness()
+            res = h.to_py(h.handle(resp(name)))
+            conf = h.proxy()
+            self.assertEqual(res["mode"], "noip" if name == "active" else "block", name)
+            self.assertEqual(conf["route"]["rules"][-1], {"action": "reject"}, name)
+            self.assertEqual(conf["dns"]["final"], "local", name)
+            self.assertEqual([o["type"] for o in conf["outbounds"]], ["direct"], name)  # 没有节点、没有 UUID
+            self.assertIn({"rule_set": ["geosite-cn", "geoip-cn"], "action": "route", "outbound": "direct"},
+                          conf["route"]["rules"])  # 国内照常
+
+    def test_expired_keeps_last_config_disabled_deletes_it(self):
+        self.handle("chain")
+        self.handle("expired")
+        self.assertIn("/etc/fleet/last.json", self.h.files)  # 续费后服务器一启用就恢复
+        self.assertIn({"domain_suffix": ["hs.example.com"], "action": "route", "outbound": "direct"},
+                      self.h.proxy()["route"]["rules"])  # 管理通道照样直连
+        self.handle("disabled")
+        self.assertNotIn("/etc/fleet/last.json", self.h.files)
+        self.assertNotIn(FX["vless_id"], self.h.files["/etc/fleet/proxy.json"])
 
     def test_same_config_twice_does_not_write_flash(self):
-        r = resp("active")
-        self.assertTrue(self.h.handle(r))
-        commits = self.h.cursor.commits
-        self.assertFalse(self.h.handle(r))
-        self.assertEqual(self.h.cursor.commits, commits)
+        self.assertTrue(self.handle("chain")["proxy"])
+        writes = [c for c in self.h.commands if c.startswith("sing-box check")]
+        res = self.handle("chain")
+        self.assertFalse(res["proxy"])
+        self.assertFalse(res["dns"])
+        self.assertEqual([c for c in self.h.commands if c.startswith("sing-box check")], writes)
 
-    def test_removed_node_is_deleted(self):
-        r = resp("active")
+    def test_check_failure_keeps_old_config(self):
+        self.handle("chain")
+        before = self.h.files["/etc/fleet/proxy.json"]
+        self.h.run_map["sing-box check"] = 1
+        res = self.handle("chain_no_udp")
+        self.assertEqual((res["proxy"], res["code"]), (False, "proxy_check"))
+        self.assertEqual(self.h.files["/etc/fleet/proxy.json"], before)
+        self.assertNotIn("/etc/fleet/proxy.json.new", self.h.files)
+
+    def test_tampered_config_is_rewritten(self):
+        r = resp("chain")
         self.h.handle(r)
-        r2 = copy.deepcopy(r)
-        r2["nodes"] = r2["nodes"][:1]
-        self.assertTrue(self.h.handle(r2))
-        nodes = self.h.sections("nodes")
-        self.assertNotIn("fleet_hbbbbbbbb22", nodes)
-        self.assertEqual(nodes["fleet_auto"]["urltest_node"], ["fleet_haaaaaaaa11"])
+        good = self.h.files["/etc/fleet/proxy.json"]
+        self.h.files["/etc/fleet/proxy.json"] = good.replace('"residential"', '"direct"')
+        state = {"version": r["version"], "status": "active"}
+        self.assertTrue(self.handle("unchanged", state)["proxy"])
+        self.assertEqual(self.h.files["/etc/fleet/proxy.json"], good)
 
-    def test_expired_block_keeps_nodes_direct_turns_off(self):
-        self.h.handle(resp("active"))
-        self.assertFalse(self.h.handle(resp("expired_block")))
-        self.assertIn("fleet_haaaaaaaa11", self.h.sections("nodes"))
-        self.assertEqual(self.h.global_opts()["enabled"], "1")
-        self.assertTrue(self.h.handle(resp("expired_direct")))
-        self.assertEqual(self.h.global_opts()["enabled"], "0")
-        self.assertIn("fleet_haaaaaaaa11", self.h.sections("nodes"))
+    def test_unchanged_without_last_config_asks_for_full(self):
+        state = self.h.to_lua({"version": "abc", "status": "active"})
+        res = self.h.M.handle(self.h.cursor, self.h.validate(resp("unchanged"))[0], state)
+        self.assertEqual(self.h.to_py(res)["mode"], "block")
+        self.assertIsNone(state["version"])
 
-    def test_disabled_removes_uuids_and_blackholes_proxy(self):
-        self.h.handle(resp("active"))
-        self.assertTrue(self.h.handle(resp("disabled")))
-        nodes = self.h.sections("nodes")
-        self.assertFalse([n for n in nodes.values() if n.get("uuid") and n[".name"].startswith("fleet_")])
-        shunt = nodes["fleet_shunt"]
-        self.assertEqual((shunt["default_node"], shunt["ProxyFront"], shunt["CN"]), ("_blackhole", "_blackhole", "_direct"))
-        self.assertEqual(self.h.global_opts()["enabled"], "1")
-        self.assertIn("fleet_direct", self.h.sections("shunt_rules"))
+    def test_missing_rule_files(self):
+        del self.h.files["/usr/share/fleet/geoip-cn.srs"]
+        res = self.handle("chain")
+        self.assertEqual(res["code"], "no_rules")
+        self.assertNotIn("rule_set", self.h.proxy()["route"])
 
-    def test_pending_only_touches_managed_router(self):
-        self.assertFalse(self.h.handle(resp("pending")))
-        self.assertEqual(self.h.global_opts()["enabled"], "0")
-        self.h.handle(resp("active"))
-        self.assertTrue(self.h.handle(resp("pending")))
-        self.assertEqual(self.h.global_opts()["enabled"], "0")
+    def test_dns_points_to_sing_box_and_management_stays_direct(self):
+        res = self.handle("chain")
+        self.assertTrue(res["dns"])
+        d = self.h.uci_section("dhcp", "cfg01411c")
+        self.assertEqual(d["noresolv"], "1")
+        self.assertEqual(d["server"][0], "127.0.0.1#1053")
+        for domain in ("hs.example.com", "ntp.aliyun.com", "time1.cloud.tencent.com"):
+            self.assertIn("/%s/223.5.5.5" % domain, d["server"])
+        self.assertEqual(len(d["server"]), 1 + 3 * 2)
+        # 有人改了 DNS：下一轮改回来
+        self.h.set_uci("dhcp", "cfg01411c", "server", ["8.8.8.8"])
+        self.assertTrue(self.handle("chain")["dns"])
+        self.assertEqual(self.h.uci_section("dhcp", "cfg01411c")["server"][0], "127.0.0.1#1053")
 
-    def test_tampered_nodes_are_restored(self):
-        r = resp("active")
-        self.h.handle(r)
-        state = {"version": r["version"], "status": "active", "snapshot": self.h.M.snapshot(self.h.cursor)}
-        self.h.set_uci("passwall2", "fleet_haaaaaaaa11", "uuid", "00000000-0000-4000-8000-000000000000")
-        self.assertTrue(self.h.handle(resp("unchanged"), state))
-        self.assertEqual(self.h.sections("nodes")["fleet_haaaaaaaa11"]["uuid"], FX["vless_id"])
+    def test_proxy_init_first_boot(self):
+        self.assertEqual(self.h.main("--proxy-init"), 0)
+        conf = self.h.proxy()
+        self.assertEqual(conf["route"]["rules"][-1], {"action": "reject"})
+        self.assertEqual(self.h.dnsmasq_restarts, 1)
+        self.assertIn("chmod 700 /etc/fleet", " ".join(self.h.commands))
+        # 已有配置：不动
+        self.h.files["/etc/fleet/proxy.json"] = "{}"
+        self.h.main("--proxy-init")
+        self.assertEqual(self.h.files["/etc/fleet/proxy.json"], "{}")
+        # 已有配置新版 sing-box 不认（升级后）：重新生成
+        self.h.run_map["sing-box check -c /etc/fleet/proxy.json >"] = 1
+        self.h.main("--proxy-init")
+        self.assertNotEqual(self.h.files.get("/etc/fleet/proxy.json"), "{}")
 
-    def test_ipv6_turned_back_on_is_noticed(self):
-        r = resp("active")
-        self.h.handle(r)
-        state = {"version": r["version"], "status": "active", "snapshot": self.h.M.snapshot(self.h.cursor)}
-        self.h.set_uci("passwall2", "cfg03", "ipv6_tproxy", "1")
-        self.assertTrue(self.h.handle(resp("unchanged"), state))
-        self.assertEqual(self.h.section_of_type("global_forwarding")["ipv6_tproxy"], "0")
+    def test_proxy_init_after_upgrade_restores_chain(self):
+        r = resp("chain")
+        self.h.files["/etc/fleet/last.json"] = json.dumps(r)
+        self.h.files["/etc/fleet/state.json"] = json.dumps({"status": "active", "version": r["version"]})
+        self.h.main("--proxy-init")
+        self.assertEqual(self.h.proxy()["route"]["final"], "residential")
+
+    def test_json_is_stable_and_escaped(self):
+        M = self.h.M
+        t = self.h.to_lua({"b": 1, "a": ["x\"y\n", True], "c": {"z": 1.5}})
+        self.assertEqual(json.loads(M.encode_json(t)), {"a": ["x\"y\n", True], "b": 1, "c": {"z": 1.5}})
+        self.assertEqual(M.encode_json(t), M.encode_json(t))
+        self.assertEqual(M.encode_json(M.array()), "[]")
+
+
+class WifiTests(unittest.TestCase):
+    SEED = "correct-horse-battery-staple-0123456789"
+
+    def setUp(self):
+        self.h = AgentHarness()
+        self.h.exec_map["sha256sum"] = self.fake_sha
+
+    @staticmethod
+    def fake_sha(cmd):
+        import hashlib
+        if "/dev/urandom" in cmd:
+            return hashlib.sha256(os.urandom(32)).hexdigest() + "  -\n"
+        arg = cmd.split("printf '%s' ", 1)[1].rsplit(" | sha256sum", 1)[0]
+        assert arg.startswith("'") and arg.endswith("'")
+        text = arg[1:-1].replace("'\\''", "'")
+        return hashlib.sha256(text.encode()).hexdigest() + "  -\n"
+
+    @classmethod
+    def expected_key(cls, seed, mac):
+        import hashlib
+        digest = hashlib.sha256(("%s:%s" % (seed, mac)).encode()).digest()
+        chars = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+        return "".join(chars[b % 32] for b in digest[:10])
+
+    def ifaces(self):
+        return [s for s in self.h.uci("wireless") if s[".type"] == "wifi-iface"]
+
+    def test_fresh_flash_with_seed(self):
+        self.h.files["/etc/fleet/wifi-seed"] = self.SEED + "\n"
+        self.assertEqual(self.h.main("--wifi-init"), 0)
+        key = self.expected_key(self.SEED, "1c2ab34d5e6f")
+        for s in self.ifaces():
+            self.assertEqual((s["ssid"], s["key"]), ("OWRT-4D5E6F", key))
+        self.assertEqual(self.h.uci_section("fleet", "main")["wifi"], "auto")
+        self.assertEqual(self.h.wifi_reloads, 1)
+        self.assertTrue(all(ch in "23456789ABCDEFGHJKLMNPQRSTUVWXYZ" for ch in key) and len(key) == 10)
+        self.assertFalse(any(key in m for m in self.h.logs))  # 日志里不写密码
+
+    def test_factory_reset_gives_same_password(self):
+        self.h.files["/etc/fleet/wifi-seed"] = self.SEED
+        self.h.main("--wifi-init")
+        first = self.ifaces()[0]["key"]
+        again = AgentHarness()
+        again.exec_map["sha256sum"] = self.fake_sha
+        again.files["/etc/fleet/wifi-seed"] = self.SEED
+        again.main("--wifi-init")
+        self.assertEqual([s for s in again.uci("wireless") if s[".type"] == "wifi-iface"][0]["key"], first)
+        # 另一台（MAC 不同）密码不同
+        other = AgentHarness()
+        other.exec_map["sha256sum"] = self.fake_sha
+        other.files["/etc/fleet/wifi-seed"] = self.SEED
+        other.files["/sys/class/net/br-lan/address"] = "1c:2a:b3:4d:5e:70\n"
+        other.main("--wifi-init")
+        self.assertNotEqual([s for s in other.uci("wireless") if s[".type"] == "wifi-iface"][0]["key"], first)
+
+    def test_without_seed_is_random(self):
+        self.h.main("--wifi-init")
+        self.assertEqual(self.h.uci_section("fleet", "main")["wifi"], "random")
+        self.assertNotEqual(self.ifaces()[0]["key"], "12345678")
+
+    def test_upgrade_from_old_firmware_keeps_wifi(self):
+        self.h.files["/etc/config/passwall2"] = "config global\n"
+        self.h.files["/etc/fleet/wifi-seed"] = self.SEED
+        self.h.main("--wifi-init")
+        self.assertEqual([(s["ssid"], s["key"]) for s in self.ifaces()], [("OWRT", "12345678")] * 2)
+        self.assertEqual(self.h.uci_section("fleet", "main")["wifi"], "kept")
+        self.h.main("--health")
+        self.assertEqual(self.ifaces()[0]["key"], "12345678")
+
+    def test_already_set_is_not_touched_again(self):
+        self.h.files["/etc/fleet/wifi-seed"] = self.SEED
+        self.h.main("--wifi-init")
+        self.h.set_uci("wireless", "default_radio0", "key", "customer-own-pass")
+        self.h.main("--wifi-init")
+        self.h.main("--health")
+        self.assertEqual(self.ifaces()[0]["key"], "customer-own-pass")
+
+    def test_wireless_config_appears_later(self):
+        c = self.h.cursor
+        for name in ("default_radio0", "default_radio1"):
+            c.delete(c, "wireless", name)
+        c.commit(c, "wireless")
+        self.h.files["/etc/fleet/wifi-seed"] = self.SEED
+        self.h.main("--wifi-init")
+        self.assertEqual(self.h.uci_section("fleet", "main")["wifi"], "pending")
+        c.set(c, "wireless", "default_radio0", "wifi-iface")
+        c.set(c, "wireless", "default_radio0", "mode", "ap")
+        c.set(c, "wireless", "default_radio0", "encryption", "none")
+        c.commit(c, "wireless")
+        self.h.main("--health")  # 每分钟的检查补上
+        s = self.h.uci_section("wireless", "default_radio0")
+        self.assertEqual((s["ssid"], s["encryption"]), ("OWRT-4D5E6F", "psk2"))
+        self.assertEqual(self.h.uci_section("fleet", "main")["wifi"], "auto")
 
 
 class RunTests(unittest.TestCase):
@@ -205,7 +402,6 @@ class RunTests(unittest.TestCase):
         self.h.files["/tmp/sysinfo/board_name"] = BOARD + "\n"
         self.h.exec_map["tailscale status --json"] = json.dumps(TS_STATUS)
         self.h.exec_map["tailscale version"] = "1.90.6\n  tailscale commit: abc\n"
-        self.h.exec_map["luci-app-passwall2"] = "luci-app-passwall2-26.11.11-r1 noarch {feeds/x} (GPL-3.0) [installed]\n"
         self.h.exec_map["echo $PPID"] = "1234\n"
 
     def serve(self, body):
@@ -221,20 +417,47 @@ class RunTests(unittest.TestCase):
         return {k: v[0] for k, v in parse_qs(urlsplit(self.last_url).query, keep_blank_values=True).items()}
 
     def test_full_run_reports_and_saves_state(self):
-        r = resp("active")
+        r = resp("chain")
         self.serve(r)
         self.assertEqual(self.h.main(), 0)
         self.assertTrue(self.last_url.startswith("http://100.64.0.9:8080/v1/config?"))
         q = self.query()
-        self.assertEqual((q["ver"], q["fw"], q["build"], q["agent"], q["board"], q["ts"], q["pw"], q["err"]),
-                         ("", FW_OLD, BUILD_OLD, "1.2.0", BOARD, "1.90.6", "26.11.11-r1", ""))
+        self.assertEqual((q["ver"], q["fw"], q["build"], q["agent"], q["board"], q["ts"], q["pw"], q["err"], q["px"]),
+                         ("", FW_OLD, BUILD_OLD, "1.3.0", BOARD, "1.90.6", "1.14.4", "", ""))
+        self.assertEqual((q["ws"], q["wk"]), ("OWRT", "12345678"))
         self.assertEqual(self.h.restarts, 1)
+        self.assertEqual(self.h.dnsmasq_restarts, 1)
         state = json.loads(self.h.files["/etc/fleet/state.json"])
-        self.assertEqual((state["version"], state["status"]), (r["version"], "active"))
-        self.serve(resp("unchanged"))
+        self.assertEqual((state["version"], state["status"], state["chain"], state["egress"]),
+                         (r["version"], "active", "ok", "203.0.113.50"))
+        self.assertTrue(any("出口 IP：203.0.113.50" in m for m in self.h.logs))
+        r2 = copy.deepcopy(r)
+        r2["status"] = "unchanged"
+        self.serve(resp("unchanged") | {"version": r["version"]})
         self.h.main()
-        self.assertEqual(self.query()["ver"], r["version"])
-        self.assertEqual(self.h.restarts, 1)
+        q = self.query()
+        self.assertEqual((q["ver"], q["px"], q["eg"]), (r["version"], "ok", "203.0.113.50"))
+        self.assertEqual((self.h.restarts, self.h.dnsmasq_restarts), (1, 1))
+
+    def test_chain_down_is_reported_and_shown(self):
+        self.h.exec_map["socks5h://127.0.0.1:7891"] = ""
+        self.serve(resp("chain"))
+        self.h.main()
+        self.assertEqual(self.h.files.get("/etc/fleet/last_error"), "chain_down")
+        state = json.loads(self.h.files["/etc/fleet/state.json"])
+        self.assertEqual((state["chain"], state.get("egress")), ("down", None))
+        self.assertEqual(len([c for c in self.h.commands if "socks5h://127.0.0.1:7891" in c]), 2)  # 重试过一次
+        self.h.exec_map["socks5h://127.0.0.1:7891"] = "ip=203.0.113.50\n"
+        self.h.main()
+        self.assertEqual(self.query()["err"], "chain_down")
+        self.assertNotIn("/etc/fleet/last_error", self.h.files)
+
+    def test_no_residential_state(self):
+        self.serve(resp("active"))
+        self.h.main()
+        state = json.loads(self.h.files["/etc/fleet/state.json"])
+        self.assertEqual(state["chain"], "noip")
+        self.assertFalse([c for c in self.h.commands if "socks5h://" in c])  # 没有链路就不查
 
     def test_old_firmware_without_build_id(self):
         del self.h.files["/etc/fleet/build_id"]
@@ -245,18 +468,18 @@ class RunTests(unittest.TestCase):
         self.assertEqual((self.query()["fw"], self.query()["build"]), ("r28000-abcdef", ""))
 
     def test_server_unreachable_keeps_config(self):
-        self.serve(resp("active"))
+        self.serve(resp("chain"))
         self.h.main()
-        before = self.h.sections()
+        before = self.h.files["/etc/fleet/proxy.json"]
         self.serve(None)
         self.h.main()
-        self.assertEqual(self.h.sections(), before)
+        self.assertEqual(self.h.files["/etc/fleet/proxy.json"], before)
         self.assertTrue(any("保持现有配置" in m for m in self.h.logs))
 
     def test_bad_response_is_reported_next_time_then_cleared(self):
         self.serve("<html>oops</html>")
         self.h.main()
-        self.assertEqual(self.h.global_opts()["enabled"], "0")
+        self.assertNotIn("/etc/fleet/proxy.json", self.h.files)
         self.assertEqual(self.h.files.get("/etc/fleet/last_error"), "bad_response")
         self.serve(resp("active"))
         self.h.main()
@@ -264,12 +487,11 @@ class RunTests(unittest.TestCase):
         self.assertNotIn("/etc/fleet/last_error", self.h.files)
 
     def test_apply_failure_is_reported(self):
-        c = self.h.cursor
-        c.delete(c, "passwall2", "cfg01")  # 没有 global 段，写不进去
-        c.commit(c, "passwall2")
-        self.serve(resp("active"))
+        self.h.run_map["sing-box check"] = 1
+        self.serve(resp("chain"))
         self.h.main()
-        self.assertEqual(self.h.files.get("/etc/fleet/last_error"), "apply")
+        self.assertEqual(self.h.files.get("/etc/fleet/last_error"), "proxy_check")
+        self.assertEqual(self.h.restarts, 0)
         self.assertIsNone(json.loads(self.h.files["/etc/fleet/state.json"]).get("version"))
 
     def test_needs_login_triggers_relogin_once_an_hour(self):
@@ -333,7 +555,7 @@ class OtaTests(RunTests):
         self.assertEqual((att["version"], att["tries"]), (self.ota["version"], 1))
         self.assertIsNone(self.errors())
         # 节点配置照样写好了（先更新配置，再升级）
-        self.assertIn("fleet_haaaaaaaa11", self.h.sections("nodes"))
+        self.assertIn("/etc/fleet/proxy.json", self.h.files)
 
     def check_refused(self, code):
         self.h.main()
@@ -446,11 +668,10 @@ class HealthTests(unittest.TestCase):
         self.h.exec_map["tailscale status --json"] = json.dumps(self.STATUS)
         self.h.exec_map["echo $PPID"] = "77\n"
         c = self.h.cursor
-        self.h.cursor = self.h.new_cursor(self.h.to_lua({
-            "passwall2": self.h.to_py(c.committed["passwall2"]),
-            "fleet": self.h.to_py(c.committed["fleet"]),
-            "athena_led": [dict(SCREEN)],
-        }))
+        data = {k: self.h.to_py(c.committed[k]) for k in ("fleet", "dhcp", "system", "wireless")}
+        data["athena_led"] = [dict(SCREEN), {".name": "cfg0a", ".type": "single_module", "module": "banner",
+                                             "duration": "4"}]
+        self.h.cursor = self.h.new_cursor(self.h.to_lua(data))
         self.serve(resp("active"))
 
     def set_temp(self, celsius):
@@ -540,21 +761,35 @@ class HealthTests(unittest.TestCase):
         self.set_temp(99)
         self.health()
         self.assertEqual(self.fetches(), [])
-        self.assertEqual(self.screen_conf()["custom_content"], "4D5E6F")
+        self.assertEqual(self.screen_conf()["custom_content"], "4D5E6F 12345678")
 
     def test_screen_id_from_device_name(self):
         self.health()
         conf = self.screen_conf()
-        self.assertEqual((conf["custom_content"], conf["fleet_id"]), ("4D5E6F", "4D5E6F"))
+        # 编号后面跟 WiFi 密码
+        self.assertEqual((conf["custom_content"], conf["fleet_id"]), ("4D5E6F 12345678", "4D5E6F 12345678"))
         self.assertEqual(self.h.screen_restarts, 1)
+        banner = [x for x in self.h.uci("athena_led") if x.get("module") == "banner"][0]
+        self.assertEqual(banner["duration"], "10")
         self.health()
         self.assertEqual(self.h.screen_restarts, 1)
+
+    def test_screen_follows_wifi_password(self):
+        self.h.set_uci("athena_led", "general", "custom_content", "4D5E6F")  # 1.2.0 写的只有编号
+        self.h.set_uci("athena_led", "general", "fleet_id", "4D5E6F")
+        self.h.set_uci("wireless", "default_radio0", "key", "K7MH3X9QPW")
+        self.health()
+        self.assertEqual(self.screen_conf()["custom_content"], "4D5E6F K7MH3X9QPW")
+        # 客户把密码改成了带小写的：屏幕显示不了小写，只显示编号
+        self.h.set_uci("wireless", "default_radio0", "key", "my-home-wifi")
+        self.health()
+        self.assertEqual(self.screen_conf()["custom_content"], "4D5E6F")
 
     def test_screen_id_falls_back_to_lan_mac(self):
         self.h.exec_map["tailscale status --json"] = json.dumps({"BackendState": "Running", "Self": {"HostName": "OpenWrt"}})
         self.h.files["/sys/class/net/br-lan/address"] = "1C:2A:B3:00:00:0A\n"
         self.health()
-        self.assertEqual(self.screen_conf()["custom_content"], "00000A")
+        self.assertEqual(self.screen_conf()["custom_content"], "00000A 12345678")
 
     def test_screen_text_set_by_admin_is_kept(self):
         self.h.set_uci("athena_led", "general", "custom_content", "HELLO")
@@ -610,6 +845,32 @@ class HealthTests(unittest.TestCase):
         self.h.files["/etc/fleet/state.json"] = json.dumps({"status": "expired", "notice": "PAY BY 12-01"})
         self.health()
         self.assertIn("'PAY BY 12-01'", self.screen_cmds()[-1])
+        # 链路断了：紧急提示，每分钟都插播
+        self.h.files["/etc/fleet/state.json"] = json.dumps({"status": "active", "chain": "down"})
+        self.h.now = 1800000060
+        self.health()
+        self.assertIn("'show 8 %s\\n' 'PROXY ERR'", self.screen_cmds()[-1])
+        # 没分配住宅 IP：长期提示
+        self.h.files["/etc/fleet/state.json"] = json.dumps({"status": "active", "chain": "noip"})
+        self.h.now = 1800000000
+        self.health()
+        self.assertIn("'show 15 %s\\n' 'NO IP'", self.screen_cmds()[-1])
+
+    def test_proxy_watchdog(self):
+        self.h.files["/etc/fleet/proxy.json"] = "{}"
+        self.health()
+        self.assertEqual(self.h.restarts, 0)
+        self.h.exec_map["pidof sing-box"] = ""  # 进程或 nft 表没了
+        self.health()
+        self.assertEqual(self.h.restarts, 1)
+        self.h.now += 60
+        self.health()
+        self.assertEqual(self.h.restarts, 1)  # 5 分钟内不重复重启
+        self.h.now += 300
+        self.health()
+        self.assertEqual(self.h.restarts, 2)
+        cmd = [c for c in self.h.commands if "pidof sing-box" in c][-1]
+        self.assertIn("nft list table inet sing-box", cmd)
 
     def test_needs_login_shows_on_screen_and_still_relogins(self):
         # 每分钟的检查只管屏幕；重新登录由每 10 分钟的同步去做（一小时最多一次）

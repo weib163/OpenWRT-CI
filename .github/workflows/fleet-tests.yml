@@ -25,6 +25,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
       - name: Fleet agent unit tests
         run: |
           python3 -m pip install --quiet --user lupa
@@ -34,12 +38,15 @@ jobs:
         run: |
           bash -n Scripts/Fleet.sh
           bash -n Scripts/Tailscale.sh
-          bash -n Scripts/fleet/passwall2-contract.sh
+          bash -n Scripts/Packages.sh
           sh -n Scripts/fleet/screen-defaults.sh
 
-      - name: PassWall 2 fields (pinned version)
+      - name: sing-box accepts the generated configs (pinned version)
         run: |
-          TAG=$(grep -oP 'UPDATE_PACKAGE "passwall2" "[^"]+" "\K[^"]+' Scripts/Packages.sh)
-          echo "PassWall 2 锁定版本：$TAG"
-          git clone -q --depth 1 --branch "$TAG" https://github.com/Openwrt-Passwall/openwrt-passwall2 /tmp/pw2
-          Scripts/fleet/passwall2-contract.sh /tmp/pw2/luci-app-passwall2
+          VER=$(grep -oP '^SING_BOX_VERSION="\K[^"]+' Scripts/Packages.sh)
+          COMMIT=$(grep -oP '^SING_BOX_COMMIT="\K[^"]+' Scripts/Packages.sh)
+          echo "sing-box 锁定版本：$VER（$COMMIT）"
+          git clone -q --depth 1 --branch "v$VER" https://github.com/SagerNet/sing-box /tmp/sing-box
+          test "$(git -C /tmp/sing-box rev-parse HEAD)" = "$COMMIT" || { echo "::error::v$VER 指向的提交变了"; exit 1; }
+          (cd /tmp/sing-box && go build -tags with_utls,with_gvisor -o /tmp/sb ./cmd/sing-box)
+          python3 Scripts/fleet/tests/check_configs.py /tmp/sb

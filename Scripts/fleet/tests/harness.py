@@ -64,17 +64,25 @@ end
 return new_cursor
 """
 
-# PassWall 2 刚装好时的配置（取自 26.11.11-1 的 0_default_config，只留测试用得到的部分）
-DEFAULT_PW = [
-    {".name": "cfg01", ".type": "global", "enabled": "0", "node": "rulenode", "localhost_proxy": "1",
-     "direct_dns_query_strategy": "UseIP", "remote_dns_query_strategy": "UseIPv4"},
-    {".name": "cfg02", ".type": "global_delay", "start_daemon": "1", "start_delay": "60"},
-    {".name": "cfg03", ".type": "global_forwarding", "tcp_redir_ports": "1:65535", "ipv6_tproxy": "0"},
-    {".name": "examplenode", ".type": "nodes", "remarks": "Example", "type": "Xray", "protocol": "socks"},
-    {".name": "rulenode", ".type": "nodes", "protocol": "_shunt", "shunt_group": "CN"},
-    {".name": "CN", ".type": "shunt_rules", "group": "CN", "domain_list": "geosite:cn"},
-    {".name": "customer_node", ".type": "nodes", "remarks": "客户自己的", "type": "sing-box", "protocol": "vmess"},
-]
+# 刚刷好时的系统配置（只留测试用得到的部分）
+DEFAULT_UCI = {
+    "fleet": [{".name": "main", ".type": "agent", "enabled": "1", "server": "", "port": "8080", "ota": "1",
+               "wifi_prefix": "OWRT"}],
+    "dhcp": [{".name": "cfg01411c", ".type": "dnsmasq", "domainneeded": "1", "filter_aaaa": "1"},
+             {".name": "lan", ".type": "dhcp", "interface": "lan"}],
+    "system": [{".name": "cfg01e48a", ".type": "system", "hostname": "OWRT"},
+               {".name": "ntp", ".type": "timeserver", "enabled": "1",
+                "server": ["ntp.aliyun.com", "time1.cloud.tencent.com"]}],
+    "wireless": [{".name": "radio0", ".type": "wifi-device", "band": "2g"},
+                 {".name": "default_radio0", ".type": "wifi-iface", "device": "radio0", "mode": "ap",
+                  "ssid": "OWRT", "key": "12345678", "encryption": "psk2+ccmp"},
+                 {".name": "radio1", ".type": "wifi-device", "band": "5g"},
+                 {".name": "default_radio1", ".type": "wifi-iface", "device": "radio1", "mode": "ap",
+                  "ssid": "OWRT", "key": "12345678", "encryption": "psk2+ccmp"}],
+}
+PROXY_FILE = "/etc/fleet/proxy.json"
+TRACE = "fl=29f\nh=www.cloudflare.com\nip=203.0.113.50\nts=1764000000\nloc=US\n"
+LAN_MAC = "1c:2a:b3:4d:5e:6f\n"
 
 TS_STATUS = {
     "BackendState": "Running",
@@ -123,14 +131,25 @@ class AgentHarness:
         env.log = lambda msg: self.logs.append(msg)
         env.sleep = lambda n: None
         env.now = lambda: self.now
-        env.restart_passwall = self._restart
+        env.exists = lambda path: path in self.files
+        env.restart_proxy = self._restart
+        env.restart_dnsmasq = self._restart_dnsmasq
+        env.wifi_reload = self._wifi_reload
         env.restart_screen = self._restart_screen
         env.relogin = self._relogin
         env.upgrade = lambda img: self.upgrades.append(img)
-        self.cursor = self.new_cursor(self.to_lua({"passwall2": copy.deepcopy(DEFAULT_PW),
-                                                   "fleet": [{".name": "main", ".type": "agent", "enabled": "1",
-                                                              "server": "", "port": "8080", "ota": "1"}]}))
+        self.dnsmasq_restarts = 0
+        self.wifi_reloads = 0
+        self.cursor = self.new_cursor(self.to_lua(copy.deepcopy(DEFAULT_UCI)))
         env.cursor = lambda: self.cursor
+        # 固件里带的东西
+        self.files["/usr/share/fleet/geosite-cn.srs"] = "SRS"
+        self.files["/usr/share/fleet/geoip-cn.srs"] = "SRS"
+        self.files["/etc/ts-loginserver"] = "https://hs.example.com\n"
+        self.files["/sys/class/net/br-lan/address"] = LAN_MAC
+        self.exec_map["sing-box version"] = "sing-box version 1.14.4\n\nEnvironment: go1.25.5 linux/arm64\n"
+        self.exec_map["socks5h://127.0.0.1:7891"] = TRACE
+        self.exec_map["pidof sing-box"] = "ok\n"
 
     # ---- JSON 桥
     def to_lua(self, v):
@@ -174,6 +193,12 @@ class AgentHarness:
     def _restart(self):
         self.restarts += 1
 
+    def _restart_dnsmasq(self):
+        self.dnsmasq_restarts += 1
+
+    def _wifi_reload(self):
+        self.wifi_reloads += 1
+
     def _restart_screen(self):
         self.screen_restarts += 1
 
@@ -181,18 +206,16 @@ class AgentHarness:
         self.relogins += 1
 
     # ---- 便捷方法
-    def sections(self, stype=None):
-        out = {}
-        for s in self.to_py(self.cursor.committed["passwall2"]):
-            if stype is None or s[".type"] == stype:
-                out[s[".name"]] = s
-        return out
+    def proxy(self):
+        """现在的 sing-box 配置（解析好的 JSON）；没有返回 None。"""
+        text = self.files.get(PROXY_FILE)
+        return json.loads(text) if text else None
 
-    def section_of_type(self, stype):
-        return [s for s in self.to_py(self.cursor.committed["passwall2"]) if s[".type"] == stype][0]
+    def uci(self, config):
+        return self.to_py(self.cursor.committed[config])
 
-    def global_opts(self):
-        return self.section_of_type("global")
+    def uci_section(self, config, name):
+        return [s for s in self.uci(config) if s[".name"] == name][0]
 
     def validate(self, resp):
         res = self.M.validate(self.to_lua(resp))

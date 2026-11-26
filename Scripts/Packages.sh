@@ -60,13 +60,40 @@ UPDATE_PACKAGE "momo" "nikkinikki-org/OpenWrt-momo" "main"
 UPDATE_PACKAGE "nikki" "nikkinikki-org/OpenWrt-nikki" "main"
 UPDATE_PACKAGE "openclash" "vernesong/OpenClash" "dev" "pkg"
 UPDATE_PACKAGE "passwall" "Openwrt-Passwall/openwrt-passwall" "main" "pkg"
-# PassWall 2 锁定版本：同步脚本按这个版本的配置字段写的。升级前先在 Scripts/fleet/passwall2-contract.sh 里验证
-UPDATE_PACKAGE "passwall2" "Openwrt-Passwall/openwrt-passwall2" "26.11.11-1" "pkg"
 
 UPDATE_PACKAGE "diskmanager" "4IceG/luci-app-mini-diskmanager" "main"
 UPDATE_PACKAGE "easytier" "EasyTier/luci-app-easytier" "main"
 UPDATE_PACKAGE "qmodem" "FUjr/QModem" "main"
 UPDATE_PACKAGE "viking" "VIKINGYFY/packages" "main" "" "axonhub gecoosac miniupnpd sing-box luci-app-homeproxy luci-app-timewol luci-app-upnp luci-app-wolplus luci-app-wolultra"
+
+#sing-box 锁定稳定版：软件源里跟的是测试版（alpha），路由器的代理配置按稳定版写。
+#按 git 提交取源码（提交哈希就是校验），上游改了 tag 也换不掉；升级前先在一台路由器上验证
+SING_BOX_VERSION="1.14.4"
+SING_BOX_COMMIT="c005f35300ce76427dc285481ec5695f5b179cd2"
+
+PIN_SING_BOX() {
+	local MK="./package/packages/sing-box/Makefile"
+	echo " "
+	if [ ! -f "$MK" ]; then
+		echo "没找到 sing-box 的 Makefile（$MK）"
+		return 1
+	fi
+	sed -i \
+		-e "s/^PKG_UPSTREAM_VERSION:=.*/PKG_UPSTREAM_VERSION:=$SING_BOX_VERSION/" \
+		-e "s/^PKG_RELEASE:=.*/PKG_RELEASE:=1/" \
+		-e "s|^PKG_SOURCE_URL:=.*|PKG_SOURCE_PROTO:=git\nPKG_SOURCE_URL:=https://github.com/SagerNet/sing-box.git\nPKG_SOURCE_VERSION:=$SING_BOX_COMMIT|" \
+		-e "s/^PKG_HASH:=.*/PKG_MIRROR_HASH:=skip/" \
+		"$MK"
+	grep -q "^PKG_UPSTREAM_VERSION:=$SING_BOX_VERSION$" "$MK" && grep -q "^PKG_SOURCE_VERSION:=$SING_BOX_COMMIT$" "$MK" \
+		&& grep -q "^PKG_SOURCE_PROTO:=git$" "$MK" && ! grep -q "^PKG_HASH:=" "$MK" || {
+		echo "sing-box 版本没锁住，Makefile 格式变了："
+		grep -n "^PKG_" "$MK"
+		return 1
+	}
+	echo "sing-box 锁定 $SING_BOX_VERSION（$SING_BOX_COMMIT）"
+}
+
+PIN_SING_BOX || exit 1
 
 UPDATE_PACKAGE "diskman" "sbwml/luci-app-diskman" "main"
 UPDATE_PACKAGE "mosdns" "sbwml/luci-app-mosdns" "v5" "" "v2dat"

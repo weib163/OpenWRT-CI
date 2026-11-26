@@ -9,13 +9,17 @@
 #   6. 复位键：短按重启；长按 30 秒以上才恢复出厂（防止客户随手一按把配置清空）
 #   7. 网页终端 ttyd 改为所有接口监听，Headscale 内网才能打开（外网仍被防火墙挡住）
 #   8. 可选：设置 root 密码（GitHub Secret ROOT_PW_HASH，只在密码为空时生效）
+#   9. 代理：sing-box 由 fleet-proxy 服务运行（家里设备：国内直连，海外 → VPN 节点 → 住宅 IP），
+#      国内名单（geosite-cn / geoip-cn）编译时打包；防火墙不许家里设备绕开代理直接上网（断网保护）
+#  10. WiFi：每台独立的名字（前缀-设备码）和密码；带了种子（GitHub Secret WIFI_SEED）时密码每台固定，恢复出厂不变
+#  11. 升级时保留 fleet 的设置和上次的代理配置（升级后马上用上，不用等第一次同步）
 # 在 ./wrt/ 目录下运行。
 set -e
 
 FILES_DIR="./files"
 SRC="$GITHUB_WORKSPACE/Scripts/fleet"
 mkdir -p "$FILES_DIR/usr/bin" "$FILES_DIR/etc/config" "$FILES_DIR/etc/init.d" "$FILES_DIR/etc/uci-defaults" \
-	"$FILES_DIR/etc/fleet" "$FILES_DIR/etc/rc.button"
+	"$FILES_DIR/etc/fleet" "$FILES_DIR/etc/rc.button" "$FILES_DIR/usr/share/fleet" "$FILES_DIR/lib/upgrade/keep.d"
 
 install -m 755 "$SRC/fleet-agent.lua" "$FILES_DIR/usr/bin/fleet-agent"
 # 固件版本号 + 编译日期，例如 1.1.0-26.11.23：fleet-agent 同步时报给管理页“固件”一栏
@@ -50,7 +54,11 @@ else
 	echo "FW_SIGN_PUBKEY 未设置：这版固件不接受远程升级（以后升级要手动刷）。"
 fi
 
-cat > "$FILES_DIR/etc/config/fleet" <<'EOF'
+# WiFi 名字前缀：工作流里的 WRT_SSID（只留字母、数字、- 和 _）
+WIFI_PREFIX=$(printf '%s' "${WRT_SSID:-WiFi}" | tr -cd 'A-Za-z0-9_-' | cut -c1-20)
+[ -n "$WIFI_PREFIX" ] || WIFI_PREFIX=WiFi
+
+cat > "$FILES_DIR/etc/config/fleet" <<EOF
 config agent 'main'
 	option enabled '1'
 	# 留空：自动找带 tag:fleet 标签的下发服务器
@@ -61,6 +69,105 @@ config agent 'main'
 	option temp_alert '90'
 	# 0 = 不接受批量升级
 	option ota '1'
+	# WiFi 名字 = 前缀-设备码。另有 wifi 一项由脚本记录：pending 待设置，auto 按种子设好，random 随机设好，kept 老机器保持原样
+	option wifi_prefix '$WIFI_PREFIX'
+EOF
+echo "WiFi 名字前缀：$WIFI_PREFIX"
+
+# WiFi 密码种子：密码 = 种子 + MAC 算出来，每台固定、恢复出厂不变。种子要和签名私钥一样备份好
+SEED="$(printf '%s' "$WIFI_SEED" | tr -d '\r\n')"
+if [ -n "$SEED" ]; then
+	if [ "${#SEED}" -lt 16 ] || printf '%s' "$SEED" | grep -q '[[:space:]]'; then
+		echo "::error::WIFI_SEED 至少 16 位，不能有空格"
+		exit 1
+	fi
+	printf '%s\n' "$SEED" > "$FILES_DIR/etc/fleet/wifi-seed"
+	chmod 600 "$FILES_DIR/etc/fleet/wifi-seed"
+	echo "WiFi 密码种子已写入固件。"
+else
+	echo "::warning::WIFI_SEED 未设置：这版固件的 WiFi 密码每次恢复出厂都会随机换"
+fi
+
+# 国内名单（sing-box 规则集）：编译时下载打包，跟着固件更新。下不来就停下，不能出一版国内也走代理的固件
+fetch_rule() {
+	local name=$1 url=$2 out="$FILES_DIR/usr/share/fleet/$1.srs"
+	curl -fsSL --retry 3 --connect-timeout 20 -o "$out" "$url" || { echo "::error::$name 下载失败"; exit 1; }
+	if [ "$(stat -c %s "$out")" -lt 10000 ] || [ "$(head -c 3 "$out")" != "SRS" ]; then
+		echo "::error::$name 内容不对（太小或者不是 sing-box 规则集）"
+		exit 1
+	fi
+	echo "国内名单 $name：$(stat -c %s "$out") 字节"
+}
+fetch_rule geosite-cn https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs
+fetch_rule geoip-cn https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs
+
+# 代理服务：配置由 fleet-agent 生成（/etc/fleet/proxy.json）；进程退出 5 秒后自动拉起。
+# sing-box 包自带的 sing-box 服务不用（第一次开机时关掉）。
+cat > "$FILES_DIR/etc/init.d/fleet-proxy" <<'EOF'
+#!/bin/sh /etc/rc.common
+# 家里设备的代理：国内直连，海外 → VPN 节点 → 住宅 IP。日志：logread -e sing-box
+USE_PROCD=1
+START=90
+STOP=10
+CONF=/etc/fleet/proxy.json
+
+start_service() {
+	/usr/bin/fleet-agent --proxy-init
+	[ -s "$CONF" ] || return 1
+	mkdir -p /tmp/fleet-proxy
+	procd_open_instance
+	procd_set_param command /usr/bin/sing-box run -c "$CONF" -D /tmp/fleet-proxy
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param limits nofile="65535 65535"
+	procd_close_instance
+}
+EOF
+chmod 755 "$FILES_DIR/etc/init.d/fleet-proxy"
+
+cat > "$FILES_DIR/etc/uci-defaults/92-fleet-proxy" <<'EOF'
+#!/bin/sh
+# 断网保护：家里设备不许绕开代理直接上网。代理停了家里就上不了网，不会漏出真实 IP。
+# 访问光猫后台这类内网地址不受影响；路由器自己的流量（Tailscale、同步、对时）不经过这里。
+uci -q delete firewall.fleet_lan_private
+uci -q delete firewall.fleet_killswitch
+uci set firewall.fleet_lan_private=rule
+uci set firewall.fleet_lan_private.name='fleet-lan-to-wan-private'
+uci set firewall.fleet_lan_private.src='lan'
+uci set firewall.fleet_lan_private.dest='wan'
+uci set firewall.fleet_lan_private.family='ipv4'
+uci set firewall.fleet_lan_private.proto='all'
+uci add_list firewall.fleet_lan_private.dest_ip='10.0.0.0/8'
+uci add_list firewall.fleet_lan_private.dest_ip='172.16.0.0/12'
+uci add_list firewall.fleet_lan_private.dest_ip='192.168.0.0/16'
+uci set firewall.fleet_lan_private.target='ACCEPT'
+uci set firewall.fleet_killswitch=rule
+uci set firewall.fleet_killswitch.name='fleet-no-direct-internet'
+uci set firewall.fleet_killswitch.src='lan'
+uci set firewall.fleet_killswitch.dest='wan'
+uci set firewall.fleet_killswitch.family='ipv4'
+uci set firewall.fleet_killswitch.proto='all'
+uci set firewall.fleet_killswitch.target='REJECT'
+uci commit firewall
+[ -x /etc/init.d/sing-box ] && /etc/init.d/sing-box disable
+/etc/init.d/fleet-proxy enable
+exit 0
+EOF
+
+# WiFi 名字和密码：刷机或恢复出厂后第一次开机设置（无线配置还没生成的话，fleet-agent --health 每分钟补）
+cat > "$FILES_DIR/etc/uci-defaults/93-fleet-wifi" <<'EOF'
+#!/bin/sh
+/usr/bin/fleet-agent --wifi-init
+exit 0
+EOF
+
+# 升级时保留：fleet 设置（WiFi 状态在里面）、上次的下发配置和代理配置。别的 /etc/fleet 文件跟着新固件走
+cat > "$FILES_DIR/lib/upgrade/keep.d/fleet" <<'EOF'
+/etc/config/fleet
+/etc/fleet/last.json
+/etc/fleet/state.json
+/etc/fleet/proxy.json
 EOF
 
 cat > "$FILES_DIR/etc/init.d/fleet-agent" <<'EOF'

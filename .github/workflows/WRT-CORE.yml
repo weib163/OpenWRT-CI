@@ -194,27 +194,26 @@ jobs:
           $GITHUB_WORKSPACE/Scripts/Handles.sh
           $GITHUB_WORKSPACE/.github/scripts/prepare-i2c-tools.sh
 
-          # PassWall 2 的配置字段要和同步脚本对得上，对不上就停下
-          $GITHUB_WORKSPACE/Scripts/fleet/passwall2-contract.sh ./package/luci-app-passwall2
-
       - name: Custom Settings
         env:
           TS_AUTHKEY: ${{secrets.TS_AUTHKEY}}
           TS_LOGIN_SERVER: ${{secrets.TS_LOGIN_SERVER}}
           FW_ZIP_PASSWORD: ${{secrets.FW_ZIP_PASSWORD}}
           ROOT_PW_HASH: ${{secrets.ROOT_PW_HASH}}
+          WIFI_SEED: ${{secrets.WIFI_SEED}}
           FW_SIGN_PUBKEY: ${{vars.FW_SIGN_PUBKEY}}
         run: |
           cd ./wrt/
 
           # 公开仓库的发布页谁都能下载：带登录密钥或 root 密码的固件必须加密，否则直接停止
-          if [[ "$WRT_TEST" != 'true' && ( -n "$TS_AUTHKEY" || -n "$ROOT_PW_HASH" ) && -z "$FW_ZIP_PASSWORD" ]]; then
-            echo "::error::已设置 TS_AUTHKEY 或 ROOT_PW_HASH 但没有设置 FW_ZIP_PASSWORD，为防止它们随固件公开，停止编译。"
+          if [[ "$WRT_TEST" != 'true' && ( -n "$TS_AUTHKEY" || -n "$ROOT_PW_HASH" || -n "$WIFI_SEED" ) && -z "$FW_ZIP_PASSWORD" ]]; then
+            echo "::error::已设置 TS_AUTHKEY、ROOT_PW_HASH 或 WIFI_SEED 但没有设置 FW_ZIP_PASSWORD，为防止它们随固件公开，停止编译。"
             exit 1
           fi
 
           $GITHUB_WORKSPACE/Scripts/Tailscale.sh
           $GITHUB_WORKSPACE/Scripts/Fleet.sh
+          if [ -n "$WIFI_SEED" ]; then echo "WRT_SEED=是（每台固定，恢复出厂不变）" >> $GITHUB_ENV; else echo "WRT_SEED=否（恢复出厂会随机换）" >> $GITHUB_ENV; fi
 
           if [[ "${WRT_CONFIG,,}" == *"test"* ]]; then
             cat $GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt >> .config
@@ -228,7 +227,13 @@ jobs:
           make defconfig -j$(nproc) && make clean -j$(nproc)
 
           echo "关键设备和插件（=y 表示会编进固件）："
-          grep -E '^CONFIG_(TARGET_DEVICE_.*jdcloud.*|PACKAGE_(xray-core|sing-box|tailscale|ttyd|kmod-tun|luci-app-passwall2|athena-led|luci-app-athena-led|luci-app-tailscale-community))=' .config || true
+          grep -E '^CONFIG_(TARGET_DEVICE_.*jdcloud.*|PACKAGE_(xray-core|sing-box|curl|tailscale|ttyd|kmod-tun|kmod-nft-queue|luci-app-passwall2|athena-led|luci-app-athena-led|luci-app-tailscale-community))=' .config || true
+          # 代理只用 sing-box：PassWall 2 或 Xray 被别的配置带进来就停下（和 fleet-proxy 抢流量）
+          if grep -qE '^CONFIG_PACKAGE_(luci-app-passwall2|luci-app-passwall|xray-core)=y' .config; then
+            echo "::error::.config 里还有 PassWall/Xray，固件只该带 sing-box"
+            exit 1
+          fi
+          grep -q '^CONFIG_PACKAGE_sing-box=y' .config || { echo "::error::.config 里没有 sing-box"; exit 1; }
 
       - name: Prepare Rust Toolchain
         if: ${{ !inputs.WRT_TEST }}
@@ -408,8 +413,9 @@ jobs:
             登录地址：${{env.WRT_IP}}
             登录密码：${{env.WRT_PW}}
 
-            WIFI名称：${{env.WRT_SSID}}
-            WIFI密码：${{env.WRT_WORD}}
+            WIFI名称：${{env.WRT_SSID}}-设备码（屏幕上的 6 位编号）
+            WIFI密码：每台不同，看路由器屏幕或管理页（从老固件升级上来的保持原来的）
+            WIFI密码固定：${{env.WRT_SEED}}
 
             内核版本：${{env.WRT_KVER}}
             插件列表：${{env.WRT_LIST}}

@@ -50,6 +50,175 @@
     "status": "active",
     "version": "11f5629486a72874"
   },
+  "chain": {
+    "auto": {
+      "interval": "3m",
+      "tolerance": 50,
+      "url": "https://www.gstatic.com/generate_204"
+    },
+    "direct": [
+      "hs.example.com",
+      "198.51.100.7"
+    ],
+    "nodes": [
+      {
+        "address": "203.0.113.10",
+        "fingerprint": "chrome",
+        "flow": "xtls-rprx-vision",
+        "id": "haaaaaaaa11",
+        "port": 443,
+        "protocol": "vless",
+        "public_key": "Z84J2IelR9ch3k8VtlVhhs5ycBUlXA7wHBWcBrjqnAw",
+        "reality": true,
+        "remarks": "菲律宾1-REALITY",
+        "short_id": "a1b2c3d4",
+        "sni": "www.microsoft.com",
+        "tls": true,
+        "transport": "tcp",
+        "uuid": "3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90"
+      },
+      {
+        "address": "cdn.example.com",
+        "alpn": "h2,http/1.1",
+        "fingerprint": "chrome",
+        "id": "hbbbbbbbb22",
+        "port": 443,
+        "protocol": "vless",
+        "reality": false,
+        "remarks": "菲律宾1-CDN备用",
+        "sni": "cdn.example.com",
+        "tls": true,
+        "transport": "ws",
+        "uuid": "3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90",
+        "ws_host": "cdn.example.com",
+        "ws_path": "/ws-9f3k?ed=2048"
+      }
+    ],
+    "on_expire": "block",
+    "refresh_seconds": 600,
+    "residential": {
+      "password": "s3cret:p@ss",
+      "port": 1080,
+      "server": "203.0.113.9",
+      "udp": true,
+      "username": "bob"
+    },
+    "schema": 1,
+    "status": "active",
+    "version": "3a81831f391e5fb2"
+  },
+  "chain_ip_auth": {
+    "auto": {
+      "interval": "3m",
+      "tolerance": 50,
+      "url": "https://www.gstatic.com/generate_204"
+    },
+    "direct": [
+      "hs.example.com",
+      "198.51.100.7"
+    ],
+    "nodes": [
+      {
+        "address": "203.0.113.10",
+        "fingerprint": "chrome",
+        "flow": "xtls-rprx-vision",
+        "id": "haaaaaaaa11",
+        "port": 443,
+        "protocol": "vless",
+        "public_key": "Z84J2IelR9ch3k8VtlVhhs5ycBUlXA7wHBWcBrjqnAw",
+        "reality": true,
+        "remarks": "菲律宾1-REALITY",
+        "short_id": "a1b2c3d4",
+        "sni": "www.microsoft.com",
+        "tls": true,
+        "transport": "tcp",
+        "uuid": "3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90"
+      },
+      {
+        "address": "cdn.example.com",
+        "alpn": "h2,http/1.1",
+        "fingerprint": "chrome",
+        "id": "hbbbbbbbb22",
+        "port": 443,
+        "protocol": "vless",
+        "reality": false,
+        "remarks": "菲律宾1-CDN备用",
+        "sni": "cdn.example.com",
+        "tls": true,
+        "transport": "ws",
+        "uuid": "3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90",
+        "ws_host": "cdn.example.com",
+        "ws_path": "/ws-9f3k?ed=2048"
+      }
+    ],
+    "on_expire": "block",
+    "refresh_seconds": 600,
+    "residential": {
+      "port": 9000,
+      "server": "gw.example.com",
+      "udp": true
+    },
+    "schema": 1,
+    "status": "active",
+    "version": "e210f9c23e06d5e9"
+  },
+  "chain_no_udp": {
+    "auto": {
+      "interval": "3m",
+      "tolerance": 50,
+      "url": "https://www.gstatic.com/generate_204"
+    },
+    "direct": [
+      "hs.example.com",
+      "198.51.100.7"
+    ],
+    "nodes": [
+      {
+        "address": "203.0.113.10",
+        "fingerprint": "chrome",
+        "flow": "xtls-rprx-vision",
+        "id": "haaaaaaaa11",
+        "port": 443,
+        "protocol": "vless",
+        "public_key": "Z84J2IelR9ch3k8VtlVhhs5ycBUlXA7wHBWcBrjqnAw",
+        "reality": true,
+        "remarks": "菲律宾1-REALITY",
+        "short_id": "a1b2c3d4",
+        "sni": "www.microsoft.com",
+        "tls": true,
+        "transport": "tcp",
+        "uuid": "3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90"
+      },
+      {
+        "address": "cdn.example.com",
+        "alpn": "h2,http/1.1",
+        "fingerprint": "chrome",
+        "id": "hbbbbbbbb22",
+        "port": 443,
+        "protocol": "vless",
+        "reality": false,
+        "remarks": "菲律宾1-CDN备用",
+        "sni": "cdn.example.com",
+        "tls": true,
+        "transport": "ws",
+        "uuid": "3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90",
+        "ws_host": "cdn.example.com",
+        "ws_path": "/ws-9f3k?ed=2048"
+      }
+    ],
+    "on_expire": "block",
+    "refresh_seconds": 600,
+    "residential": {
+      "password": "s3cret:p@ss",
+      "port": 1080,
+      "server": "203.0.113.9",
+      "udp": false,
+      "username": "bob"
+    },
+    "schema": 1,
+    "status": "active",
+    "version": "1155e71a5906bcb1"
+  },
   "disabled": {
     "on_expire": "block",
     "refresh_seconds": 600,
@@ -57,19 +226,12 @@
     "status": "disabled",
     "version": "4e796cf4da6392b0"
   },
-  "expired_block": {
+  "expired": {
     "on_expire": "block",
     "refresh_seconds": 600,
     "schema": 1,
     "status": "expired",
     "version": "7748a3260ba74471"
-  },
-  "expired_direct": {
-    "on_expire": "direct",
-    "refresh_seconds": 600,
-    "schema": 1,
-    "status": "expired",
-    "version": "524e9cd453fec7f4"
   },
   "limited": {
     "on_expire": "block",
