@@ -385,6 +385,15 @@ function M.handle(req)
 		return 200, info
 	end
 
+	if action == "tzcheck" then
+		-- 页面读出这台设备的时区报上来：只用来提醒，不拦上网
+		if not M.write_ok(req, "application/json") then return 403, { error = "csrf" } end
+		local body = type(req.body) == "table" and req.body or {}
+		local res, why = agent.record_client_tz(req.remote, body.tz, body.offset)
+		if not res then return 400, { error = why } end
+		return 200, res
+	end
+
 	if action == "upload" then
 		if not M.write_ok(req, "application/octet-stream") then return 403, { error = "csrf" } end
 		if not authed then return 401, { error = "login" } end
@@ -454,6 +463,7 @@ function M.cgi()
 		content_type = env("CONTENT_TYPE") or "",
 		length = tonumber(env("CONTENT_LENGTH") or ""),
 		auth = env("HTTP_AUTHORIZATION"),
+		remote = env("REMOTE_ADDR"),
 	}
 	local ctype = req.content_type:lower():match("^([^;%s]+)") or ""
 	if req.method == "POST" and ctype == "application/json" then

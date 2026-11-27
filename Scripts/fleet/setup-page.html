@@ -22,6 +22,11 @@ label.radio{display:inline-flex;align-items:center;gap:4px;margin-right:14px}lab
 <div>设备码 <span class="code" id="device">------</span></div>
 <div class="small muted">遇到问题联系客服时报这个设备码。完整后台只有客服能进。</div>
 
+<div class="card hide" id="tzwarn" style="border-color:var(--warn)"><h2 class="warn">这台设备的时区不对</h2>
+<div id="tzwarntext"></div>
+<div class="small muted">iPhone：设置 → 通用 → 日期与时间 → 关闭“自动设置” → 选上面的城市。安卓：设置 → 系统 → 日期和时间 → 关闭“自动确定时区” → 选城市。电脑：右下角时间 → 调整日期和时间 → 时区。改好后刷新这个页面。</div>
+</div>
+
 <div class="card"><h2>状态</h2><div id="status" class="muted">读取中…</div></div>
 
 <div class="card hide" id="kfcard"><h2>客服 · 续费 · 售后 · 问题反馈</h2>
@@ -191,6 +196,16 @@ $("flashbtn").onclick=async()=>{
   else{$("upmsg").className="msg bad";$("upmsg").textContent=r.body.message||"没能开始升级"}
 };
 $("logout").onclick=async()=>{await api("logout",{json:{}});setToken("");showLogin(true)};
+let tzChecked=false;
+async function checkTz(){
+  if(tzChecked)return;tzChecked=true;
+  let tz="",off=0;try{tz=Intl.DateTimeFormat().resolvedOptions().timeZone||"";off=-new Date().getTimezoneOffset()}catch(e){return}
+  if(!/^[A-Za-z0-9_\/+-]{1,40}$/.test(tz))return;
+  const r=await api("tzcheck",{json:{tz:tz,offset:off}});
+  if(!r.ok||r.body.ok!==false){$("tzwarn").classList.add("hide");return}
+  $("tzwarntext").textContent="你这台设备现在是 "+tz+"，要改成 "+(r.body.zone||"").replace(/_/g," ")+(r.body.label?"（"+r.body.label+"）":"")+"，和住宅 IP 所在地一致，账号才不容易出问题。";
+  $("tzwarn").classList.remove("hide");
+}
 async function refresh(){try{const r=await api("status");if(r.ok)renderStatus(r.body);else $("status").textContent="读取失败（"+r.status+"）"}catch(e){$("status").textContent="读取失败，刷新页面再试"}}
-refresh();setInterval(refresh,15000);
+refresh().then(checkTz);setInterval(refresh,15000);
 </script></body></html>

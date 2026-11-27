@@ -741,6 +741,41 @@ class RunTests(unittest.TestCase):
             r["support"].update(change)
             self.assertIsNone(self.h.validate(r)[0], change)
 
+    def test_client_timezone_reminder(self):
+        h = self.h
+        h.exec_map["date +%z"] = "-0800\n"
+        h.files["/proc/net/arp"] = ("IP address       HW type     Flags       HW address            Mask     Device\n"
+                                    "192.168.10.50    0x1         0x2         aa:bb:cc:dd:ee:01     *        br-lan\n"
+                                    "192.168.10.51    0x1         0x2         aa:bb:cc:dd:ee:02     *        br-lan\n")
+        h.files["/tmp/dhcp.leases"] = "1800003600 aa:bb:cc:dd:ee:01 192.168.10.50 iPhone-Li 01:aa\n"
+        # 服务器还没设时区：不判断
+        res = h.to_py(h.M.record_client_tz("192.168.10.50", "Asia/Shanghai", 480))
+        self.assertTrue(res["ok"])
+        self.assertEqual(h.M.tz_mismatch_report(h.to_lua({})), "0")
+        self.assertNotIn("( sleep 2; /usr/bin/fleet-agent --now ) >/dev/null 2>&1 &", h.commands)
+        del h.files["/etc/fleet/tz-clients.json"]
+        state = {"tz_zone": "America/Los_Angeles", "tz_label": "UTC-8"}
+        h.files["/etc/fleet/state.json"] = json.dumps(state)
+        res = h.to_py(h.M.record_client_tz("192.168.10.50", "Asia/Shanghai", 480))
+        self.assertEqual((res["ok"], res["zone"], res["label"]), (False, "America/Los_Angeles", "UTC-8"))
+        self.assertIn("( sleep 2; /usr/bin/fleet-agent --now ) >/dev/null 2>&1 &", h.commands)  # 马上报给服务器
+        # 同一时区的别名（温哥华）算对；不在租约里的设备用 MAC 后 4 位
+        self.assertTrue(h.to_py(h.M.record_client_tz("192.168.10.51", "America/Vancouver", -480))["ok"])
+        h.M.record_client_tz("192.168.10.51", "UTC", 0)
+        self.assertEqual(h.M.tz_mismatch_report(h.to_lua(state)), "2:iPhone-Li~Asia/Shanghai,EE02~UTC")
+        # 改好了：提醒取消
+        h.M.record_client_tz("192.168.10.50", "America/Los_Angeles", -480)
+        h.M.record_client_tz("192.168.10.51", "America/Los_Angeles", -480)
+        self.assertEqual(h.M.tz_mismatch_report(h.to_lua(state)), "0")
+        # 30 天没再检测的记录作废
+        h.M.record_client_tz("192.168.10.50", "Asia/Tokyo", 540)
+        h.now += 31 * 86400
+        self.assertEqual(h.M.tz_mismatch_report(h.to_lua(state)), "0")
+        for ip, tz, off in (("192.168.10.99", "UTC", 0), ("192.168.10.50", "a b", 0), ("192.168.10.50", "UTC", 9999),
+                            ("x", "UTC", 0)):
+            res = h.M.record_client_tz(ip, tz, off)
+            self.assertIsNone(res[0] if isinstance(res, tuple) else res, (ip, tz, off))
+
     def test_status_info_for_setup_page(self):
         self.serve(resp("active"))
         self.h.main()

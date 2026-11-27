@@ -239,6 +239,25 @@ class PaidTests(unittest.TestCase):
         self.assertNotIn("/tmp/fleet-setup/paid.stamp", self.h.a.files)  # 没发出去：可以马上再试
 
 
+class TzCheckTests(unittest.TestCase):
+    def test_tzcheck(self):
+        h = SetupHarness()
+        h.a.exec_map["date +%z"] = "-0800\n"
+        h.a.files["/proc/net/arp"] = "IP address HW type Flags HW address Mask Device\n192.168.10.50 0x1 0x2 aa:bb:cc:dd:ee:01 * br-lan\n"
+        h.a.files["/etc/fleet/state.json"] = json.dumps({"tz_zone": "America/Los_Angeles", "tz_label": "UTC-8"})
+        req = {"method": "POST", "action": "tzcheck", "host": "192.168.10.1", "content_type": "application/json",
+               "remote": "192.168.10.50", "body": {"tz": "Asia/Shanghai", "offset": 480}}
+        code, res = h.S.handle(h.a.to_lua(req))
+        self.assertEqual((code, h.a.to_py(res)["ok"]), (200, False))
+        req["body"] = {"tz": "America/Los_Angeles", "offset": -480}
+        code, res = h.S.handle(h.a.to_lua(req))
+        self.assertTrue(h.a.to_py(res)["ok"])
+        req["body"] = {"tz": "x'; reboot", "offset": 0}
+        self.assertEqual(h.S.handle(h.a.to_lua(req))[0], 400)
+        req["content_type"] = "text/plain"
+        self.assertEqual(h.S.handle(h.a.to_lua(req))[0], 403)
+
+
 class UpgradeTests(unittest.TestCase):
     def setUp(self):
         self.h = SetupHarness()

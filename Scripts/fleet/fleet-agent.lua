@@ -1338,6 +1338,8 @@ function M.run(opts)
 	local ssid, key = M.wifi_info(c)
 	if ssid then url = url .. "&ws=" .. urlencode(ssid) end
 	if key then url = url .. "&wk=" .. urlencode(key) end
+	-- 家里时区设错的设备（上网设置页检测到的），管理页提醒；改好了提醒自动取消
+	url = url .. "&tzm=" .. urlencode(M.tz_mismatch_report(state))
 	-- 顺带上报 CPU 温度和是否超温（下发服务据此在管理页和面板用户备注里显示告警）
 	local health = M.health_check(M.temp_threshold(conf), M.env.now())
 	if health.temp then
@@ -1604,6 +1606,92 @@ function M.paid(channel)
 	local ok, v = pcall(json().parse, body or "")
 	if ok and type(v) == "table" and v.ok == true then return true end
 	return nil, "server"
+end
+
+-- 家里设备的时区：上网设置页用浏览器读出来（路由器从网络流量里看不到），记在这里。
+-- 不拦设备上网，只上报给管理页提醒；30 天没再检测的记录作废。
+M.TZ_CLIENTS = "/etc/fleet/tz-clients.json"
+M.TZ_CLIENT_DAYS = 30
+
+-- 路由器现在的 UTC 偏移（分钟，东边为正）
+function M.router_offset()
+	local z = M.env.exec("date +%z 2>/dev/null"):match("^([+-]%d%d%d%d)")
+	if not z then return nil end
+	local sign = z:sub(1, 1) == "-" and -1 or 1
+	return sign * (tonumber(z:sub(2, 3)) * 60 + tonumber(z:sub(4, 5)))
+end
+
+-- 这台设备的时区对不对：IANA 名字一样，或者现在的偏移一样（同一时区的别名，比如温哥华和洛杉矶）
+function M.client_tz_ok(entry, zone, offset)
+	if type(entry) ~= "table" then return true end
+	if zone and entry.tz == zone then return true end
+	return offset ~= nil and tonumber(entry.offset) == offset
+end
+
+-- 上报给服务器的字符串：数量:名字~时区,名字~时区（最多 5 个）；服务器没设时区时不判断，报 0
+function M.tz_mismatch_report(state)
+	local zone = type(state.tz_zone) == "string" and state.tz_zone ~= "" and state.tz_zone or nil
+	if not zone then return "0" end
+	local clients = M.read_json(M.TZ_CLIENTS) or {}
+	local offset, now = M.router_offset(), M.env.now()
+	local bad = {}
+	for mac, e in pairs(clients) do
+		if type(e) == "table" and type(mac) == "string" and now - (tonumber(e.ts) or 0) < M.TZ_CLIENT_DAYS * 86400
+			and not M.client_tz_ok(e, zone, offset) then
+			bad[#bad + 1] = { name = e.name, mac = mac, tz = e.tz, ts = tonumber(e.ts) or 0 }
+		end
+	end
+	table.sort(bad, function(a, b) if a.ts ~= b.ts then return a.ts > b.ts end return a.mac < b.mac end)
+	local parts = {}
+	for i = 1, math.min(#bad, 5) do
+		local b = bad[i]
+		local name = type(b.name) == "string" and b.name:gsub("[^%w%-_.]", ""):sub(1, 20) or ""
+		if name == "" then name = b.mac:gsub(":", ""):sub(-4):upper() end
+		local tz = type(b.tz) == "string" and b.tz:match("^[%w_/+%-]+$") and b.tz:sub(1, 40) or "?"
+		parts[#parts + 1] = name .. "~" .. tz
+	end
+	return #bad .. (#parts > 0 and (":" .. table.concat(parts, ",")) or "")
+end
+
+-- 上网设置页报来一台设备的时区。返回 { ok, zone, label } 或 nil, 原因；状态变了（对↔错）马上同步一次
+function M.record_client_tz(ip, tz, offset)
+	if not M.is_ipv4(ip or "") then return nil, "ip" end
+	if type(tz) ~= "string" or #tz > 40 or not tz:match("^[%w_/+%-]+$") then return nil, "tz" end
+	offset = tonumber(offset)
+	if not offset or offset < -840 or offset > 840 then return nil, "offset" end
+	local mac, name
+	for line in (M.env.read("/proc/net/arp") or ""):gmatch("[^\n]+") do
+		local aip, amac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+		if aip == ip then mac = amac:lower() end
+	end
+	if not mac then return nil, "mac" end
+	for line in (M.env.read("/tmp/dhcp.leases") or ""):gmatch("[^\n]+") do
+		local lmac, lname = line:match("^%d+%s+(%S+)%s+%S+%s+(%S+)")
+		if lmac and lmac:lower() == mac and lname ~= "*" then name = lname:gsub("[^%w%-_.]", ""):sub(1, 20) end
+	end
+	local state = M.read_json(M.STATE_FILE) or {}
+	local zone = type(state.tz_zone) == "string" and state.tz_zone ~= "" and state.tz_zone or nil
+	local router_offset = M.router_offset()
+	local clients = M.read_json(M.TZ_CLIENTS) or {}
+	local now = M.env.now()
+	local old = clients[mac]
+	local entry = { tz = tz, offset = offset, ts = now, name = name }
+	local ok = M.client_tz_ok(entry, zone, router_offset)
+	local before = M.tz_mismatch_report(state)
+	-- 没变化、一天内记过：不写闪存
+	if not (old and old.tz == tz and tonumber(old.offset) == offset and old.name == name and now - (tonumber(old.ts) or 0) < 86400) then
+		for k, e in pairs(clients) do
+			if type(e) ~= "table" or now - (tonumber(e.ts) or 0) >= M.TZ_CLIENT_DAYS * 86400 then clients[k] = nil end
+		end
+		clients[mac] = entry
+		M.write_json(M.TZ_CLIENTS, clients)
+	end
+	-- 要报给服务器的内容变了（有设备设错、改好了）：马上同步一次，管理页的提醒跟着变
+	if zone and M.tz_mismatch_report(state) ~= before then
+		M.env.log("设备 " .. (name or mac) .. " 的时区" .. (ok and "对了" or ("不对：" .. tz)))
+		M.env.run("( sleep 2; /usr/bin/fleet-agent --now ) >/dev/null 2>&1 &")
+	end
+	return { ok = (zone == nil) or ok, zone = zone or "", label = type(state.tz_label) == "string" and state.tz_label or "" }
 end
 
 -- 给“上网设置”页看的状态（不含任何密钥）
