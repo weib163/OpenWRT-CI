@@ -18,7 +18,7 @@
 -- 批量升级另外要 usign 和 /etc/fleet/fw-sign.pub。
 
 local M = {}
-M.VERSION = "1.4.0"
+M.VERSION = "1.4.1"
 M.STATE_FILE = "/etc/fleet/state.json"
 M.LAST_FILE = "/etc/fleet/last.json"
 M.ERROR_FILE = "/etc/fleet/last_error"
@@ -44,6 +44,12 @@ M.SCREEN_PLACEHOLDER = "??????"
 M.SCREEN_URGENT_SECONDS = 8
 M.SCREEN_NOTE_SECONDS = 15
 M.PROXY_RESTART_STAMP = "/tmp/fleet/proxy-restart"
+-- 指定域名停用名单（16 个）：环境检测不达标时自动拦，达标时放行。
+-- 服务器每次同步也会下发一份名单（domain_block_domains），有下发的用下发的，没有就用这里这份。
+M.BLOCK_DOMAINS = { "claude.ai", "anthropic.com", "claude.com", "claudeusercontent.com",
+	"claude.app", "claudemcpcontent.com", "clau.de", "api-iam.intercom.io", "nexus-websocket-a.intercom.io",
+	"us5.datadoghq.com", "http-intake.logs.us5.datadoghq.com", "browser-intake-us5-datadoghq.com",
+	"r.stripe.com", "us.sentry.io", "siftscience.com", "fcmtoken.googleapis.com" }
 
 local STATUSES = { active = true, unchanged = true, pending = true, expired = true,
 	limited = true, disabled = true, no_nodes = true }
@@ -339,6 +345,16 @@ function M.validate(r)
 	-- 服务器有没有给这个用户分配住宅 IP；没分配时服务器那头是拒绝的，屏幕显示 NO IP
 	out.has_residential = bool_or(r.has_residential, true)
 	if out.udp == nil or out.global == nil or out.has_residential == nil then return nil, "udp/global/has_residential 不合法" end
+	-- 指定域名停用规则：服务器说了拦（domain_block=true）才拦；没说就不拦。
+	-- 名单用服务器下发的，服务器没下发就用固件里那份（M.BLOCK_DOMAINS）。
+	out.domain_block = r.domain_block == true
+	local block_domains = {}
+	if type(r.domain_block_domains) == "table" then
+		for _, d in ipairs(r.domain_block_domains) do
+			if M.is_hostname(d) and #block_domains < 20 then block_domains[#block_domains + 1] = d:lower() end
+		end
+	end
+	out.domain_block_domains = block_domains
 	return out
 end
 
@@ -485,6 +501,18 @@ function M.proxy_config(cfg, rules)
 	if #domains > 0 then
 		route_rules[#route_rules + 1] = { domain_suffix = domains, action = "route", outbound = "direct" }
 		dns_rules[#dns_rules + 1] = { domain_suffix = domains, action = "route", server = "local" }
+	end
+	-- 指定域名停用规则：这一轮要拦时，名单里的域名在 DNS 和路由两层都拒绝，
+	-- 插在直连名单之后、国内名单和最终出口之前；不要拦时不加，照常走 VPN。
+	local block_domains = array()
+	if cfg and cfg.domain_block == true then
+		local src = (cfg.domain_block_domains and #cfg.domain_block_domains > 0)
+			and cfg.domain_block_domains or M.BLOCK_DOMAINS
+		for _, d in ipairs(src) do block_domains[#block_domains + 1] = d end
+	end
+	if #block_domains > 0 then
+		route_rules[#route_rules + 1] = { domain_suffix = block_domains, action = "reject" }
+		dns_rules[#dns_rules + 1] = { domain_suffix = block_domains, action = "reject" }
 	end
 	local rule_set
 	if rules and not global then

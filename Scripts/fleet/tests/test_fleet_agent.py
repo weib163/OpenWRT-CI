@@ -221,6 +221,38 @@ class ProxyTests(unittest.TestCase):
         self.handle("active_no_udp")
         self.assertEqual(self.h.proxy()["route"]["rules"][-1], {"network": ["udp"], "action": "reject"})
 
+    def test_domain_block_rule(self):
+        # 平时（没说拦）：名单里的域名没有拒绝规则，照常走 VPN
+        self.handle("active")
+        conf = self.h.proxy()
+        self.assertEqual(conf["route"]["final"], "vpn")
+        self.assertFalse([r for r in conf["route"]["rules"]
+                          if r.get("action") == "reject" and "domain_suffix" in r])
+        # 服务器说了拦：名单里的域名在 DNS 和路由两层都拒绝，其他流量照常
+        blocked = resp("active")
+        blocked["domain_block"] = True
+        blocked["domain_block_domains"] = ["claude.ai", "anthropic.com"]
+        self.h.handle(blocked)
+        conf = self.h.proxy()
+        self.assertEqual(conf["route"]["final"], "vpn")
+        self.assertIn({"domain_suffix": ["claude.ai", "anthropic.com"], "action": "reject"},
+                      conf["route"]["rules"])
+        self.assertIn({"domain_suffix": ["claude.ai", "anthropic.com"], "action": "reject"},
+                      conf["dns"]["rules"])
+        self.assertIn({"domain_suffix": ["hs.example.com"], "action": "route", "outbound": "direct"},
+                      conf["route"]["rules"])  # 管理通道照样直连
+        # 服务器只说了拦、没给名单：用固件里那份 16 个
+        blocked2 = resp("active")
+        blocked2["domain_block"] = True
+        self.h.handle(blocked2)
+        conf = self.h.proxy()
+        rules = [r for r in conf["route"]["rules"]
+                 if r.get("action") == "reject" and "domain_suffix" in r]
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(len(rules[0]["domain_suffix"]), 16)
+        self.assertIn("claude.ai", rules[0]["domain_suffix"])
+        self.assertIn("fcmtoken.googleapis.com", rules[0]["domain_suffix"])
+
     def test_global_mode_sends_china_through_vpn_too(self):
         self.handle("active_global")
         conf = self.h.proxy()
@@ -514,7 +546,7 @@ class RunTests(unittest.TestCase):
         self.assertTrue(self.last_url.startswith("http://100.64.0.9:8080/v1/config?"))
         q = self.query()
         self.assertEqual((q["ver"], q["fw"], q["build"], q["agent"], q["board"], q["ts"], q["pw"], q["err"], q["px"]),
-                         ("", FW_OLD, BUILD_OLD, "1.4.0", BOARD, "1.90.6", "1.14.4", "", ""))
+                         ("", FW_OLD, BUILD_OLD, "1.4.1", BOARD, "1.90.6", "1.14.4", "", ""))
         self.assertEqual((q["ws"], q["wk"]), ("OWRT", "12345678"))
         self.assertEqual(self.h.restarts, 1)
         self.assertEqual(self.h.dnsmasq_restarts, 1)
