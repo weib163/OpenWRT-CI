@@ -46,7 +46,7 @@ class SetupHarness:
         return self.save_ok
 
     def call(self, action, method="POST", body=None, auth=None, ctype=None, host="192.168.10.1", origin=None,
-             length=None):
+             length=None, remote=None):
         if ctype is None:
             ctype = "application/json" if method == "POST" else ""
         req = {"method": method, "action": action, "host": host, "content_type": ctype}
@@ -56,6 +56,8 @@ class SetupHarness:
             req["auth"] = "Bearer " + auth
         if length is not None:
             req["length"] = length
+        if remote is not None:
+            req["remote"] = remote
         if body is not None:
             req["body"] = body
         code, res = self.S.handle(self.a.to_lua(req))
@@ -256,6 +258,112 @@ class TzCheckTests(unittest.TestCase):
         self.assertEqual(h.S.handle(h.a.to_lua(req))[0], 400)
         req["content_type"] = "text/plain"
         self.assertEqual(h.S.handle(h.a.to_lua(req))[0], 403)
+
+
+class PortalActionTests(unittest.TestCase):
+    ARP = ("IP address HW type Flags HW address Mask Device\n"
+           "192.168.10.50 0x1 0x2 aa:bb:cc:dd:ee:01 * br-lan\n")
+    LEASES = "1800003600 aa:bb:cc:dd:ee:01 192.168.10.50 iPhone-Li 01:aa\n"
+
+    def setUp(self):
+        self.h = SetupHarness()
+        self.h.a.files["/proc/net/arp"] = self.ARP
+        self.h.a.files["/tmp/dhcp.leases"] = self.LEASES
+
+    def probe(self, host="captive.apple.com", remote="192.168.10.50", method="GET"):
+        h = self.h
+        req = {"method": method, "action": "probe", "host": host, "remote": remote}
+        r = h.S.handle(h.a.to_lua(req))
+        if not isinstance(r, tuple):
+            return r, None, None
+        return r[0], h.a.to_py(r[1]), (h.a.to_py(r[2]) if len(r) > 2 else None)
+
+    def test_probe_redirects_when_due(self):
+        code, _, raw = self.probe()
+        self.assertEqual(code, 302)
+        self.assertEqual(raw["location"], "http://192.168.10.1/portal.html")
+        # 弹过一次：再探测就回成功响应
+        code, _, raw = self.probe()
+        self.assertEqual(code, 200)
+        self.assertEqual((raw["content_type"], raw["body"]), ("text/html", "Success\n"))
+
+    def test_probe_returns_expected_success_per_os(self):
+        # 先弹一次（记上时间），再探测就回各系统要的成功响应
+        self.assertEqual(self.probe()[0], 302)
+        # 安卓：204 空；Windows：connecttest；Firefox：success
+        code, _, raw = self.probe("connectivitycheck.gstatic.com")
+        self.assertEqual((code, raw.get("content_type"), raw["body"]), (204, None, ""))
+        code, _, raw = self.probe("www.msftconnecttest.com")
+        self.assertEqual((code, raw["body"]), (200, "Microsoft Connect Test\n"))
+        code, _, raw = self.probe("detectportal.firefox.com")
+        self.assertEqual((code, raw["body"]), (200, "success\n"))
+
+    def test_probe_rejects_non_probe_and_non_get(self):
+        code, res, raw = self.probe("example.com")
+        self.assertEqual((code, res["error"]), (404, "not_found"))
+        self.assertIsNone(raw)
+        # POST 的探测请求不走探测分支（host_ok 拦住探测域名）
+        code, res, _ = self.probe(method="POST")
+        self.assertEqual((code, res["error"]), (403, "bad_host"))
+
+    def test_probe_bypasses_host_check_but_status_does_not(self):
+        code, res = self.h.call("status", method="GET", host="captive.apple.com")
+        self.assertEqual((code, res["error"]), (403, "bad_host"))
+
+    def test_portal_status_needs_no_login(self):
+        self.h.a.files["/etc/fleet/state.json"] = json.dumps({
+            "status": "active", "chain": "ok", "egress": "203.0.113.50",
+            "expire_at": 1798761600, "tz_zone": "America/Los_Angeles", "tz_label": "UTC-8"})
+        code, res = self.h.call("portal-status", method="GET")
+        self.assertEqual(code, 200)
+        self.assertEqual((res["egress"], res["chain"], res["status"], res["expire_at"]),
+                         ("203.0.113.50", "ok", "active", 1798761600))
+        self.assertEqual((res["tz_zone"], res["tz_label"]), ("America/Los_Angeles", "UTC-8"))
+        self.assertTrue(res["ipv6_blocked"])
+        self.assertNotIn("device", res)  # 不带设备信息
+
+    def test_portal_done_and_optout(self):
+        h = self.h
+        h.a.exec_map["date +%z"] = "-0800\n"
+        h.a.files["/etc/fleet/state.json"] = json.dumps({"tz_zone": "America/Los_Angeles", "tz_label": "UTC-8"})
+        code, res = h.call("portal-done", body={"tz": "America/Los_Angeles", "offset": -480, "lang": "en-US"},
+                           remote="192.168.10.50")
+        self.assertEqual((code, res["ok"]), (200, True))
+        rec = json.loads(h.a.files["/etc/fleet/portal-clients.json"])["aa:bb:cc:dd:ee:01"]
+        self.assertEqual((rec["tz"], rec["lang"]), ("America/Los_Angeles", "en-US"))
+        # 时区也记到 tz-clients 里（装机页的提醒跟着变）
+        self.assertIn("aa:bb:cc:dd:ee:01", json.loads(h.a.files["/etc/fleet/tz-clients.json"]))
+        # 格式不对：400；不是 JSON：403
+        self.assertEqual(h.call("portal-done", body={"tz": "a b", "offset": 0}, remote="192.168.10.50")[0], 400)
+        self.assertEqual(h.call("portal-done", body={"tz": "UTC", "offset": 0, "lang": "en_US!"},
+                                remote="192.168.10.50")[0], 400)
+        self.assertEqual(h.call("portal-done", body={"tz": "UTC", "offset": 0}, remote="192.168.10.50",
+                               ctype="text/plain")[0], 403)
+        # 不再提示
+        code, res = h.call("portal-optout", body={}, remote="192.168.10.50")
+        self.assertEqual((code, res["ok"]), (200, True))
+        rec = json.loads(h.a.files["/etc/fleet/portal-clients.json"])["aa:bb:cc:dd:ee:01"]
+        self.assertTrue(rec["opted_out"])
+        code, _, raw = self.probe()
+        self.assertEqual(code, 200)  # 不再提示：探测直接回成功响应
+
+    def test_cgi_probe(self):
+        h = self.h
+        env = {"REQUEST_METHOD": "GET", "QUERY_STRING": "a=probe", "HTTP_HOST": "captive.apple.com",
+               "REMOTE_ADDR": "192.168.10.50"}
+        out = []
+        h.S.env.getenv = lambda name: env.get(name)
+        h.S.env.write_stdout = out.append
+        h.S.cgi()
+        head, body = out[0].split("\r\n\r\n", 1)
+        self.assertTrue(head.startswith("Status: 302 Found"), head)
+        self.assertIn("Location: http://192.168.10.1/portal.html", head)
+        self.assertEqual(body, "")
+        # 弹过一次：再探测就回成功响应
+        h.S.cgi()
+        head, body = out[1].split("\r\n\r\n", 1)
+        self.assertTrue(head.startswith("Status: 200 OK"), head)
+        self.assertEqual(body, "Success\n")
 
 
 class UpgradeTests(unittest.TestCase):

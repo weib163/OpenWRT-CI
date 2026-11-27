@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>上网状态检查</title>
+<style>
+:root{--line:#e5e7eb;--muted:#6b7280;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--acc:#2563eb;--card:#fff;--bg:#f9fafb;--fg:#111827}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:560px;margin:0 auto;padding:16px 14px 40px}
+h1{font-size:20px;margin:4px 0 2px}
+.sub{color:var(--muted);font-size:14px;margin:0 0 12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:12px 0}
+.card h2{font-size:16px;margin:0 0 8px}
+.row{display:flex;gap:10px;justify-content:space-between;align-items:flex-start;padding:9px 0;border-top:1px solid var(--line)}
+.row:first-of-type{border-top:0}
+.row .nm{font-weight:600}
+.row .val{color:var(--muted);font-size:14px;word-break:break-all}
+.row .hint{color:var(--bad);font-size:14px}
+.row .note{color:var(--muted);font-size:13px}
+.pill{flex:none;font-size:13px;font-weight:600;padding:2px 9px;border-radius:999px;white-space:nowrap}
+.pill.ok{color:var(--ok);background:#dcfce7}
+.pill.fail{color:var(--bad);background:#fee2e2}
+.pill.unknown{color:var(--muted);background:#f3f4f6}
+.pill.warn{color:var(--warn);background:#fef3c7}
+.pill.info{color:var(--muted);background:#f3f4f6}
+.pill.run{color:var(--acc);background:#dbeafe}
+.verdict{font-size:18px;font-weight:700}
+.verdict.ok{color:var(--ok)}
+.verdict.fail{color:var(--bad)}
+.verdict.unknown{color:var(--muted)}
+.failist{margin:8px 0 0;padding-left:18px}
+.failist li{margin:4px 0}
+.btns{display:flex;flex-direction:column;gap:10px;margin-top:14px}
+button,a.btn{display:block;width:100%;text-align:center;padding:12px;border-radius:10px;border:1px solid var(--line);background:#fff;color:var(--fg);font-size:16px;cursor:pointer;text-decoration:none}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+button:disabled{opacity:.5;cursor:default}
+.done-msg{color:var(--ok);font-weight:600;text-align:center;margin-top:10px}
+.err{color:var(--bad)}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>上网状态检查</h1>
+<p class="sub">每天一次：连上路由器后检查出口、地区和泄漏情况。只提醒，不拦网——点“完成”就可以上网。</p>
+
+<div class="card">
+<div class="verdict unknown" id="verdict">正在检测…</div>
+<ul class="failist" id="failist"></ul>
+</div>
+
+<div class="card"><h2>① 出口与一致性</h2><div id="sec-exit"></div></div>
+<div class="card"><h2>② 地区一致性</h2><div id="sec-region"></div></div>
+<div class="card"><h2>③ 泄漏</h2><div id="sec-leak"></div></div>
+<div class="card"><h2>④ 指纹展示（只展示，不阻断）</h2><div id="sec-fp"></div></div>
+<div class="card"><h2>⑤ 请求头与代理痕迹</h2><div id="sec-headers"></div></div>
+<div class="card"><h2>⑥ 路由器侧状态</h2><div id="sec-router"></div></div>
+
+<div class="btns">
+<a class="btn" href="https://ip.net.coffee/claude/" target="_blank" rel="noreferrer">去看完整评分（外部检测页）</a>
+<button class="primary" id="btn-done">完成 / 继续上网</button>
+<button id="btn-optout">这台设备不再提示</button>
+<button id="btn-retry">重新检测</button>
+</div>
+<div class="done-msg" id="done-msg"></div>
+</div>
+
+<script>
+"use strict";
+// 检测结果只在页面里显示，不上传、不保存。
+// 每项结果：st 是 ok（通过）/ fail（失败）/ unknown（测不出来）/ warn（提醒，不算失败）/ info（只展示）
+// val 是读到的值，hint 是失败时的改法。
+var R = {}; // 路由器侧状态（portal-status）
+var SHARED = { ips: [], country: "", cf: null, ipinfo: null, stun: null, ipv6: null, doh: null, trace: null, headers: null };
+
+function $(id) { return document.getElementById(id); }
+function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function(c) { return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
+function isIPv4(s) { return typeof s === "string" && /^(\d{1,3}\.){3}\d{1,3}$/.test(s) && s.split(".").every(function(p) { return +p <= 255; }); }
+
+function fetchText(url, ms) {
+  var c = new AbortController();
+  var t = setTimeout(function() { c.abort(); }, ms);
+  return fetch(url, { signal: c.signal, cache: "no-store" })
+    .then(function(r) { if (!r.ok) throw new Error("http " + r.status); return r.text(); })
+    .finally(function() { clearTimeout(t); });
+}
+function fetchJSON(url, ms) { return fetchText(url, ms).then(function(t) { return JSON.parse(t); }); }
+function fetchOk(url, ms) { // 只测“通不通”，不读内容（不用等跨域许可）
+  var c = new AbortController();
+  var t = setTimeout(function() { c.abort(); }, ms);
+  return fetch(url, { signal: c.signal, mode: "no-cors", cache: "no-store" })
+    .then(function() { return true; })
+    .catch(function() { return false; })
+    .finally(function() { clearTimeout(t); });
+}
+function parseTrace(text) { // Cloudflare trace 格式：每行 key=value
+  var o = {};
+  (text || "").split("\n").forEach(function(line) {
+    var i = line.indexOf("=");
+    if (i > 0) o[line.slice(0, i)] = line.slice(i + 1);
+  });
+  return o;
+}
+function tzName() { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch (e) { return ""; } }
+function tzOffset() { return -new Date().getTimezoneOffset(); }
+function langRegion(lang) { var m = (lang || "").match(/[-_]([a-zA-Z]{2})$/); return m ? m[1].toUpperCase() : ""; }
+function countryName(code) {
+  var map = { US: "美国", CN: "中国", JP: "日本", KR: "韩国", SG: "新加坡", HK: "香港", TW: "台湾", GB: "英国", DE: "德国", FR: "法国", CA: "加拿大", AU: "澳大利亚" };
+  return map[code] || code;
+}
+
+// ---------- 浏览器侧测量 ----------
+function stunCheck(ms) { // STUN 候选地址：srflx 是 UDP 出口，host 是本机地址
+  return new Promise(function(resolve) {
+    var srflx = null, hosts = [], mdns = false, done = false, pc = null;
+    function finish() {
+      if (done) return; done = true;
+      try { pc && pc.close(); } catch (e) {}
+      resolve({ srflx: srflx, hosts: hosts, mdns: mdns });
+    }
+    try {
+      pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }] });
+      pc.createDataChannel("x");
+      pc.onicecandidate = function(e) {
+        if (!e.candidate) { finish(); return; }
+        var m = (e.candidate.candidate || "").match(/candidate:\S+ \d+ \S+ \d+ (\S+) \d+ typ (\w+)/);
+        if (!m) return;
+        var addr = m[1], type = m[2];
+        if (type === "srflx") srflx = addr;
+        else if (type === "host") {
+          if (addr.indexOf(".local") >= 0) mdns = true;
+          else if (hosts.indexOf(addr) < 0) hosts.push(addr);
+        }
+      };
+      pc.createOffer().then(function(o) { return pc.setLocalDescription(o); }).catch(finish);
+    } catch (e) { finish(); return; }
+    setTimeout(finish, ms);
+  });
+}
+function canvasHash() {
+  try {
+    var cv = document.createElement("canvas");
+    cv.width = 200; cv.height = 50;
+    var ctx = cv.getContext("2d");
+    if (!ctx) return "";
+    ctx.fillStyle = "#f0f0f0"; ctx.fillRect(0, 0, 200, 50);
+    ctx.fillStyle = "#333"; ctx.font = "16px sans-serif";
+    ctx.fillText("上网状态检查", 10, 25);
+    ctx.fillStyle = "rgba(37,99,235,0.7)"; ctx.fillRect(10, 32, 120, 8);
+    var s = cv.toDataURL(), h = 2166136261;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return ("0000000" + (h >>> 0).toString(16)).slice(-8);
+  } catch (e) { return ""; }
+}
+function webglInfo() {
+  try {
+    var cv = document.createElement("canvas");
+    var gl = cv.getContext("webgl") || cv.getContext("experimental-webgl");
+    if (!gl) return { vendor: "", renderer: "" };
+    var ext = gl.getExtension("WEBGL_debug_renderer_info");
+    var vendor = "", renderer = "";
+    if (ext) {
+      vendor = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) || "";
+      renderer = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || "";
+    }
+    if (!renderer) renderer = gl.getParameter(gl.RENDERER) || "";
+    return { vendor: vendor, renderer: renderer };
+  } catch (e) { return { vendor: "", renderer: "" }; }
+}
+function fontList() { // 量几个常见字体的宽度，和等宽字体不一样就当它装了（只展示）
+  var test = ["Arial", "Helvetica", "Times New Roman", "Courier New", "Georgia", "Verdana", "Tahoma", "Trebuchet MS", "Palatino", "PingFang SC", "Microsoft YaHei", "SimSun", "Noto Sans CJK SC"];
+  var found = [];
+  try {
+    var cv = document.createElement("canvas");
+    var ctx = cv.getContext("2d");
+    if (!ctx) return found;
+    var s = "mmmmmmmmmmlli";
+    function w(f) { ctx.font = "16px " + f; return ctx.measureText(s).width; }
+    var bw = w("monospace");
+    test.forEach(function(f) { if (w(f) !== bw) found.push(f); });
+  } catch (e) {}
+  return found;
+}
+function routerOffsetMinutes() { // 路由器时区标签（如 UTC-8）换算成分钟
+  var m = (R.tz_label || "").match(/^UTC([+-])(\d+)(?::(\d+))?$/);
+  if (!m) return null;
+  return (m[1] === "-" ? -1 : 1) * (+m[2] * 60 + +((m[3]) || 0));
+}
+
+// ---------- 检测项 ----------
+var CHECKS = [
+{ id: "egress", sec: "sec-exit", name: "出口 IP", run: function() {
+  if (isIPv4(R.egress)) return { st: "ok", val: R.egress };
+  return { st: "fail", val: "没读到出口 IP", hint: "路由器还没同步到状态，稍后点“重新检测”再试一次" };
+} },
+{ id: "exit-svc", sec: "sec-exit", name: "各服务看到的出口", run: function() {
+  var ips = SHARED.ips;
+  if (!ips.length) return { st: "unknown", val: "各服务端点都没响应" };
+  var counts = {}, list = [];
+  ips.forEach(function(e) { if (!counts[e.ip]) { counts[e.ip] = 0; list.push(e.ip); } counts[e.ip]++; });
+  var val = ips.length + " 个服务端点，读到 " + list.map(function(ip) { return ip + " ×" + counts[ip]; }).join("、");
+  if (list.length === 1 && (!R.egress || list[0] === R.egress)) return { st: "ok", val: val };
+  return { st: "fail", val: val, hint: "出口 IP 在变，或者有流量没走隧道：先看下面“路由器侧状态”里的代理状态" };
+} },
+{ id: "dns-exit", sec: "sec-exit", name: "DNS 出口", run: function() {
+  var t = SHARED.dnsTrace;
+  if (!t || !t.ip) return { st: "unknown", val: "加密解析端点没响应" };
+  if (!R.egress) return { st: "unknown", val: "DNS 出口 " + t.ip + "；没读到数据出口，没法比对" };
+  if (t.ip !== R.egress) return { st: "fail", val: "DNS 出口 " + t.ip + "，数据出口 " + R.egress, hint: "DNS 没走同一出口：检查路由器上的 DNS 设置" };
+  return { st: "ok", val: "DNS 出口 " + t.ip + "，和数据出口一致" };
+} },
+{ id: "udp-exit", sec: "sec-exit", name: "UDP 出口", run: function() {
+  var s = SHARED.stun;
+  if (!s) return { st: "unknown", val: "没测到" };
+  if (s.srflx) {
+    if (!R.egress) return { st: "unknown", val: "UDP 出口 " + s.srflx + "；没读到数据出口，没法比对" };
+    if (s.srflx !== R.egress) return { st: "fail", val: "UDP 出口 " + s.srflx + "，数据出口 " + R.egress, hint: "UDP 没走同一出口：检查路由器上的 UDP 设置" };
+    return { st: "ok", val: "UDP 出口 " + s.srflx + "，和数据出口一致" };
+  }
+  if (R.udp === false) return { st: "ok", val: "没有 UDP 候选地址（UDP 已在路由器上拒绝）" };
+  return { st: "unknown", val: "没拿到 UDP 候选地址（STUN 不通）" };
+} },
+{ id: "tz", sec: "sec-region", name: "时区", run: function() {
+  var name = tzName(), off = tzOffset(), roff = routerOffsetMinutes();
+  var val = (name || "未知时区") + "（UTC" + (off >= 0 ? "+" : "") + (off / 60) + "）";
+  if (!R.tz_zone) return { st: "unknown", val: val + "；路由器还没下发时区" };
+  if (name === R.tz_zone || (roff != null && off === roff)) return { st: "ok", val: val + "；路由器时区 " + R.tz_zone };
+  return { st: "fail", val: val + "；路由器时区 " + R.tz_zone, hint: "把这台设备的时区改成出口国家所在时区（设置 → 日期与时间）" };
+} },
+{ id: "lang", sec: "sec-region", name: "语言", run: function() {
+  var lang = (navigator.language || "") + (navigator.languages && navigator.languages.length > 1 ? "（另有 " + navigator.languages.slice(1).join("、") + "）" : "");
+  if (!SHARED.country) return { st: "unknown", val: lang + "；没读到出口国家" };
+  var region = langRegion(navigator.language);
+  if (!region) return { st: "ok", val: lang + "；语言没写地区，不矛盾" };
+  if (region === SHARED.country) return { st: "ok", val: lang + "；出口在" + countryName(SHARED.country) };
+  return { st: "fail", val: lang + "；出口在" + countryName(SHARED.country), hint: "把这台设备的语言改成出口国家的语言" };
+} },
+{ id: "locale", sec: "sec-region", name: "区域格式", run: function() {
+  var o = {};
+  try { o = Intl.DateTimeFormat().resolvedOptions(); } catch (e) {}
+  var locale = o.locale || "", region = langRegion(locale.replace("_", "-"));
+  var val = locale + (o.hourCycle ? " · " + (o.hourCycle === "h12" ? "12 小时制" : "24 小时制") : "");
+  if (!SHARED.country) return { st: "unknown", val: val + "；没读到出口国家" };
+  if (!region) return { st: "ok", val: val + "；区域格式没写地区，不矛盾" };
+  if (region === SHARED.country) return { st: "ok", val: val + "；出口在" + countryName(SHARED.country) };
+  return { st: "fail", val: val + "；出口在" + countryName(SHARED.country), hint: "把这台设备的区域格式改成出口国家的" };
+} },
+{ id: "webrtc", sec: "sec-leak", name: "WebRTC 候选地址", run: function() {
+  var s = SHARED.stun;
+  if (!s) return { st: "unknown", val: "没测到" };
+  var note = s.mdns ? "（浏览器用假名代替了局域网地址，正常）" : "";
+  if (s.srflx) {
+    if (!R.egress) return { st: "unknown", val: "STUN 看到 UDP 出口 " + s.srflx + "；没读到数据出口，没法比对" + note };
+    if (s.srflx !== R.egress) return { st: "fail", val: "STUN 看到 UDP 出口 " + s.srflx + "，和数据出口不一致" + note, hint: "UDP 没走同一出口：检查路由器上的 UDP 设置" };
+    return { st: "ok", val: "STUN 看到 UDP 出口 " + s.srflx + "，和数据出口一致" + note };
+  }
+  return { st: "ok", val: "没有 UDP 候选地址（不泄漏）" + note };
+} },
+{ id: "ipv6", sec: "sec-leak", name: "IPv6 暴露", run: function() {
+  if (SHARED.ipv6 == null) return { st: "unknown", val: "没测到" };
+  if (SHARED.ipv6) return { st: "fail", val: "IPv6 能直连", hint: "IPv6 流量会绕开隧道：路由器已拦 IPv6，检查这台设备是不是还开着 IPv6" };
+  return { st: "ok", val: "IPv6 不通（路由器已拦）" };
+} },
+{ id: "lan", sec: "sec-leak", name: "局域网地址", run: function() {
+  var s = SHARED.stun;
+  if (!s) return { st: "unknown", val: "没测到" };
+  if (s.hosts.length) return { st: "info", val: "读到局域网地址：" + s.hosts.join("、") + "（家里内网地址，正常）" };
+  if (s.mdns) return { st: "info", val: "浏览器已用假名隐藏局域网地址" };
+  return { st: "info", val: "没有读到局域网地址" };
+} },
+{ id: "doh", sec: "sec-leak", name: "DNS 加密解析可达", run: function() {
+  if (SHARED.doh == null) return { st: "unknown", val: "没测到" };
+  if (SHARED.doh) return { st: "ok", val: "1.1.1.1 / Google 加密解析能通" };
+  return { st: "unknown", val: "加密解析没响应（测不出来）" };
+} },
+{ id: "canvas", sec: "sec-fp", name: "Canvas 哈希", run: function() {
+  var h = canvasHash();
+  return { st: "info", val: h ? "0x" + h : "读不到" };
+} },
+{ id: "webgl", sec: "sec-fp", name: "WebGL", run: function() {
+  var g = webglInfo();
+  return { st: "info", val: (g.renderer || "读不到") + (g.vendor ? "（" + g.vendor + "）" : "") };
+} },
+{ id: "screen", sec: "sec-fp", name: "屏幕与设备", run: function() {
+  return { st: "info", val: screen.width + "×" + screen.height + " @" + (window.devicePixelRatio || 1) + " · 色深 " + screen.colorDepth + " · " + ("ontouchstart" in window ? "触屏" : "非触屏") };
+} },
+{ id: "hw", sec: "sec-fp", name: "硬件参数", run: function() {
+  return { st: "info", val: (navigator.platform || "未知平台") + " · CPU 线程 " + (navigator.hardwareConcurrency || "?") + " · 内存约 " + (navigator.deviceMemory || "?") + "GB" };
+} },
+{ id: "fonts", sec: "sec-fp", name: "字体", run: function() {
+  var f = fontList();
+  return { st: "info", val: f.length ? "装了 " + f.length + " 个常见字体：" + f.join("、") : "没读到常见字体" };
+} },
+{ id: "trace", sec: "sec-headers", name: "出口服务信息", run: function() {
+  var t = SHARED.cf;
+  if (!t) return { st: "unknown", val: "服务端点没响应" };
+  var val = "节点 " + (t.colo || "?") + " · TLS " + (t.tls || "?") + " · HTTP " + (t.http || "?");
+  if (t.warp === "on") return { st: "fail", val: val + " · 检测到 WARP", hint: "流量多走了一层代理：关掉这台设备上的 WARP" };
+  return { st: "ok", val: val + " · 没检测到 WARP" };
+} },
+{ id: "webdriver", sec: "sec-headers", name: "自动化痕迹", run: function() {
+  if (navigator.webdriver) return { st: "fail", val: "浏览器有自动化痕迹", hint: "这台设备上跑着自动化工具：换一台正常设备再试" };
+  return { st: "ok", val: "没有自动化痕迹" };
+} },
+{ id: "proxy-hdr", sec: "sec-headers", name: "代理头", run: function() {
+  var h = SHARED.headers && SHARED.headers.headers;
+  if (!h) return { st: "unknown", val: "回显端点没响应" };
+  var bad = [];
+  Object.keys(h).forEach(function(k) {
+    var lk = k.toLowerCase();
+    if (lk === "via" || lk === "forwarded" || lk === "x-forwarded-for" || lk === "x-real-ip" || lk.indexOf("signature-agent") >= 0) bad.push(k);
+  });
+  var val = "User-Agent：" + (h["User-Agent"] || h["user-agent"] || "?") + " · 语言：" + (h["Accept-Language"] || h["accept-language"] || "?");
+  if (bad.length) return { st: "fail", val: val + " · 服务器看到了代理头：" + bad.join("、"), hint: "有代理头被带到服务端：检查中间是不是多了一层代理" };
+  return { st: "ok", val: val + " · 没有代理头" };
+} },
+{ id: "proxy", sec: "sec-router", name: "代理状态", run: function() {
+  var st = R.status || "", chain = R.chain || "";
+  if (!st) return { st: "unknown", val: "路由器还没同步到状态" };
+  if (st === "active" && chain === "ok") return { st: "ok", val: "正常" };
+  if (chain === "down") return { st: "fail", val: "代理链路断了（" + st + "）", hint: "等路由器恢复，或重启路由器再试" };
+  if (st === "expired") return { st: "fail", val: "已到期", hint: "续费后恢复" };
+  if (st === "noip" || st === "no_nodes") return { st: "fail", val: "没有可用节点", hint: "等路由器分配节点，或联系客服" };
+  return { st: "warn", val: st + (chain ? "（" + chain + "）" : "") };
+} },
+{ id: "expire", sec: "sec-router", name: "到期时间", run: function() {
+  var e = R.expire_at;
+  if (!e) return { st: "unknown", val: "没读到到期时间" };
+  var d = new Date(e * 1000);
+  var days = Math.ceil((e * 1000 - Date.now()) / 86400000);
+  var val = d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate() + "（还有 " + days + " 天）";
+  if (days <= 0) return { st: "fail", val: "已到期（" + val + "）", hint: "续费后恢复" };
+  if (days <= 7) return { st: "warn", val: val, hint: "快到期了，记得续费" };
+  return { st: "ok", val: val };
+} },
+{ id: "block", sec: "sec-router", name: "域名停用规则", run: function() {
+  if (R.domain_block === true) return { st: "info", val: "正在拦相关域名（环境不达标时自动拦）" };
+  return { st: "info", val: "当前没在拦（环境达标）" };
+} },
+{ id: "fw", sec: "sec-router", name: "固件与路由器时区", run: function() {
+  return { st: "info", val: "固件 " + (R.firmware || "?") + " · 路由器时区 " + (R.tz_zone || "?") + (R.tz_label ? "（" + R.tz_label + "）" : "") };
+} },
+];
+
+// ---------- 渲染与总评 ----------
+var RESULTS = {};
+function pillText(st) { return { ok: "通过", fail: "失败", unknown: "测不出来", warn: "提醒", info: "展示", run: "检测中" }[st] || st; }
+function buildRows() {
+  CHECKS.forEach(function(c) {
+    var sec = $(c.sec);
+    var row = document.createElement("div");
+    row.className = "row";
+    row.id = "row-" + c.id;
+    row.innerHTML = '<div><div class="nm">' + esc(c.name) + '</div><div class="val">检测中…</div></div><span class="pill run">检测中</span>';
+    sec.appendChild(row);
+  });
+}
+function setResult(c, res) {
+  RESULTS[c.id] = res;
+  var row = $("row-" + c.id);
+  if (!row) return;
+  var pill = row.querySelector(".pill");
+  pill.className = "pill " + res.st;
+  pill.textContent = pillText(res.st);
+  var html = '<div class="nm">' + esc(c.name) + '</div><div class="val">' + esc(res.val || "") + "</div>";
+  if (res.hint) html += '<div class="hint">改法：' + esc(res.hint) + "</div>";
+  row.querySelector(".nm").parentNode.innerHTML = html;
+}
+function safeRun(c) {
+  try { return c.run() || { st: "unknown", val: "没测到" }; }
+  catch (e) { return { st: "unknown", val: "检测出错" }; }
+}
+function updateVerdict() {
+  var fails = CHECKS.filter(function(c) { return RESULTS[c.id] && RESULTS[c.id].st === "fail"; });
+  var oks = CHECKS.filter(function(c) { return RESULTS[c.id] && RESULTS[c.id].st === "ok"; });
+  var v = $("verdict"), fl = $("failist");
+  fl.innerHTML = "";
+  if (fails.length) {
+    v.className = "verdict fail";
+    v.textContent = "有 " + fails.length + " 项失败";
+    fails.forEach(function(c) {
+      var li = document.createElement("li");
+      li.innerHTML = "<b>" + esc(c.name) + "</b>：" + esc(RESULTS[c.id].hint || RESULTS[c.id].val || "");
+      fl.appendChild(li);
+    });
+  } else if (oks.length) {
+    v.className = "verdict ok";
+    v.textContent = "通过";
+  } else {
+    v.className = "verdict unknown";
+    v.textContent = "检测未完成（网络不通或外部服务没响应）";
+  }
+}
+
+// ---------- 跑检测 ----------
+function runAll() {
+  RESULTS = {};
+  CHECKS.forEach(function(c) {
+    var row = $("row-" + c.id);
+    if (row) { row.querySelector(".pill").className = "pill run"; row.querySelector(".pill").textContent = "检测中"; }
+  });
+  $("verdict").className = "verdict unknown";
+  $("verdict").textContent = "正在检测…";
+  $("failist").innerHTML = "";
+  return fetch("/cgi-bin/api?a=portal-status", { cache: "no-store" })
+    .then(function(r) { return r.json(); })
+    .then(function(s) { R = s || {}; })
+    .catch(function() { R = {}; })
+    .then(function() {
+      // 上报时区（和装机页一样；失败不管）
+      try {
+        fetch("/cgi-bin/api?a=tzcheck", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tz: tzName(), offset: tzOffset() }) }).catch(function() {});
+      } catch (e) {}
+      // 外部端点（走隧道去测，看到的就是出口）
+      return Promise.all([
+        fetchText("https://www.cloudflare.com/cdn-cgi/trace", 6000).then(parseTrace).catch(function() { return null; }),
+        fetchJSON("https://ipinfo.io/json", 6000).catch(function() { return null; }),
+        fetchJSON("https://api.ip.sb/geoip", 6000).catch(function() { return null; }),
+        fetchText("https://chatgpt.com/cdn-cgi/trace", 6000).then(parseTrace).catch(function() { return null; }),
+        fetchText("https://claude.ai/cdn-cgi/trace", 6000).then(parseTrace).catch(function() { return null; }),
+        fetchText("https://myip.ipip.net", 6000).catch(function() { return null; }),
+        stunCheck(4000),
+        fetchOk("https://[2606:4700:4700::1111]/cdn-cgi/trace", 4000),
+        Promise.all([fetchOk("https://1.1.1.1/dns-query?name=example.com&type=A", 4000), fetchOk("https://dns.google/dns-query?name=example.com&type=A", 4000)]).then(function(r) { return r[0] || r[1]; }),
+        fetchText("https://1.1.1.1/cdn-cgi/trace", 6000).then(parseTrace).catch(function() { return null; }),
+        fetchJSON("https://httpbin.org/headers", 6000).catch(function() { return null; })
+      ]);
+    })
+    .then(function(res) {
+      SHARED.cf = res[0]; SHARED.ipinfo = res[1];
+      SHARED.ips = [];
+      if (res[0] && res[0].ip) SHARED.ips.push({ src: "cf", ip: res[0].ip });
+      if (res[1] && res[1].ip) SHARED.ips.push({ src: "ipinfo", ip: res[1].ip });
+      if (res[2] && res[2].ip) SHARED.ips.push({ src: "ipsb", ip: res[2].ip });
+      if (res[3] && res[3].ip) SHARED.ips.push({ src: "svc-a", ip: res[3].ip });
+      if (res[4] && res[4].ip) SHARED.ips.push({ src: "svc-b", ip: res[4].ip });
+      if (typeof res[5] === "string") { var m = res[5].match(/(\d{1,3}\.){3}\d{1,3}/); if (m) SHARED.ips.push({ src: "ipip", ip: m[0] }); }
+      SHARED.country = (res[1] && res[1].country) || (res[0] && res[0].loc) || (res[2] && res[2].country_code) || "";
+      SHARED.stun = res[6]; SHARED.ipv6 = res[7]; SHARED.doh = res[8];
+      SHARED.dnsTrace = res[9]; SHARED.headers = res[10];
+      CHECKS.forEach(function(c) { setResult(c, safeRun(c)); });
+      updateVerdict();
+    })
+    .catch(function() { updateVerdict(); });
+}
+
+// ---------- 按钮 ----------
+function postApi(action, body) {
+  return fetch("/cgi-bin/api?a=" + action, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {})
+  }).then(function(r) { return r.json(); });
+}
+$("btn-done").addEventListener("click", function() {
+  var btn = $("btn-done");
+  btn.disabled = true;
+  postApi("portal-done", { tz: tzName(), offset: tzOffset(), lang: navigator.language || "" })
+    .catch(function() {})
+    .then(function() {
+      $("done-msg").textContent = "已完成，可以上网了。关掉这个窗口就行。";
+      $("btn-optout").disabled = true;
+      $("btn-retry").disabled = true;
+    });
+});
+$("btn-optout").addEventListener("click", function() {
+  postApi("portal-optout", {}).catch(function() {}).then(function() {
+    $("done-msg").textContent = "以后这台设备不再弹出检测页。可以关掉这个窗口了。";
+    $("btn-done").disabled = true;
+    $("btn-optout").disabled = true;
+  });
+});
+$("btn-retry").addEventListener("click", function() { runAll(); });
+
+buildRows();
+runAll();
+</script>

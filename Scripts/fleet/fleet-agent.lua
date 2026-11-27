@@ -18,7 +18,7 @@
 -- 批量升级另外要 usign 和 /etc/fleet/fw-sign.pub。
 
 local M = {}
-M.VERSION = "1.4.1"
+M.VERSION = "1.4.2"
 M.STATE_FILE = "/etc/fleet/state.json"
 M.LAST_FILE = "/etc/fleet/last.json"
 M.ERROR_FILE = "/etc/fleet/last_error"
@@ -50,6 +50,45 @@ M.BLOCK_DOMAINS = { "claude.ai", "anthropic.com", "claude.com", "claudeuserconte
 	"claude.app", "claudemcpcontent.com", "clau.de", "api-iam.intercom.io", "nexus-websocket-a.intercom.io",
 	"us5.datadoghq.com", "http-intake.logs.us5.datadoghq.com", "browser-intake-us5-datadoghq.com",
 	"r.stripe.com", "us.sentry.io", "siftscience.com", "fcmtoken.googleapis.com" }
+
+-- 每天一次联网检测弹窗（1.4.2）：设备连上 WiFi 时系统自己会发连通性探测
+-- （苹果、安卓、Windows 各有自己的探测地址，都是明文 HTTP），
+-- 探测域名解析到路由器内网 IP（见 ensure_portal_dns），探测请求就打到路由器上的上网设置页。
+-- 这台设备 24 小时内没弹过、且没选“不再提示”，就 302 到检测页，手机自动弹出窗口；
+-- 否则直接返回探测本来期望的成功响应，手机认为网络正常，不弹。
+M.PORTAL_CLIENTS = "/etc/fleet/portal-clients.json"
+M.PORTAL_INTERVAL = 86400 -- 每天最多弹一次
+M.PORTAL_DAYS = 30 -- 30 天没再检测的记录作废
+-- 探测域名（按手机厂商的探测地址列出）→ 探测本来要的成功响应
+M.PROBE_HOSTS = {
+	["captive.apple.com"] = "apple",
+	["connectivitycheck.gstatic.com"] = "android",
+	["www.gstatic.com"] = "android",
+	["clients3.google.com"] = "android",
+	["www.msftconnecttest.com"] = "msft",
+	["www.msftncsi.com"] = "msft-ncsi",
+	["detectportal.firefox.com"] = "firefox",
+}
+-- 探测域名固定顺序（写 DNS 覆盖和测试时用）
+M.PROBE_DOMAINS = {
+	"captive.apple.com", "connectivitycheck.gstatic.com", "www.gstatic.com",
+	"clients3.google.com", "www.msftconnecttest.com", "www.msftncsi.com",
+	"detectportal.firefox.com",
+}
+
+-- 探测域名本来要的成功响应（手机只认这个）；不是探测域名返回 nil
+-- apple：200 + Success；android：204 空；msft：200 + Microsoft Connect Test；
+-- msft-ncsi：200 + Microsoft NCSI；firefox：200 + success
+function M.probe_response(host)
+	local name = tostring(host or ""):lower():match("^([^:]+)") or ""
+	local kind = M.PROBE_HOSTS[name]
+	if kind == "apple" then return 200, "text/html", "Success\n" end
+	if kind == "android" then return 204, nil, "" end
+	if kind == "msft" then return 200, "text/plain", "Microsoft Connect Test\n" end
+	if kind == "msft-ncsi" then return 200, "text/plain", "Microsoft NCSI\n" end
+	if kind == "firefox" then return 200, "text/plain", "success\n" end
+	return nil
+end
 
 local STATUSES = { active = true, unchanged = true, pending = true, expired = true,
 	limited = true, disabled = true, no_nodes = true }
@@ -640,6 +679,38 @@ function M.ensure_dns(c, domains)
 	return changed
 end
 
+-- 内网地址（uci 里 network.lan.ipaddr）
+function M.lan_ip(c)
+	local ip = c:get("network", "lan", "ipaddr")
+	if type(ip) == "table" then ip = ip[1] end
+	return type(ip) == "string" and ip:match("^([%d%.]+)") or nil
+end
+
+-- 探测域名解析到路由器内网 IP（手机的连通性探测才会打到路由器上的检测页）。
+-- 和 ensure_dns 一样只动属于探测域名的 address 项，别的项原样保留。返回 changed
+function M.ensure_portal_dns(c, lan_ip)
+	if not lan_ip or not M.is_ipv4(lan_ip) then return false end
+	local sec
+	c:foreach("dhcp", "dnsmasq", function(s) sec = sec or s[".name"] end)
+	if not sec then return false end
+	local cur = c:get("dhcp", sec, "address")
+	if type(cur) ~= "table" then cur = cur and { cur } or {} end
+	local kept = {}
+	for _, e in ipairs(cur) do
+		if type(e) == "string" then
+			local dom = e:match("^/([^/]+)/")
+			if not (dom and M.PROBE_HOSTS[dom:lower()]) then kept[#kept + 1] = e end
+		end
+	end
+	for _, d in ipairs(M.PROBE_DOMAINS) do kept[#kept + 1] = "/" .. d .. "/" .. lan_ip end
+	local same = #cur == #kept
+	for i = 1, #kept do if cur[i] ~= kept[i] then same = false end end
+	if same then return false end
+	c:set("dhcp", sec, "address", kept)
+	c:commit("dhcp")
+	return true
+end
+
 -- ------------------------------------------------------------ WiFi
 -- 名字 = 前缀-设备码（屏幕上的 6 位编号）；密码 10 位，只用屏幕能显示、不容易看混的大写字母和数字。
 -- 固件带了种子（/etc/fleet/wifi-seed）时密码由种子 + MAC 算出：每台固定，恢复出厂还是同一个。
@@ -1108,6 +1179,7 @@ function M.handle(c, resp, state)
 	local tz_changed, dhcp_changed = M.apply_timezone(c, cfg.timezone)
 	res.tz = tz_changed
 	res.dns = res.dns or dhcp_changed
+	res.dns = res.dns or M.ensure_portal_dns(c, M.lan_ip(c))
 	return res
 end
 
@@ -1572,6 +1644,8 @@ function M.health_run()
 	if type(lan_ip) == "table" then lan_ip = lan_ip[1] end
 	if type(lan_ip) == "string" then lan_ip = lan_ip:match("^([%d%.]+)") end
 	M.ensure_setup_redirect(c, lan_ip)
+	-- 探测域名解析改了：dnsmasq 重启一次才生效
+	if M.ensure_portal_dns(c, lan_ip) then M.env.restart_dnsmasq() end
 	M.screen_tick(M.env.cursor(), {
 		ts = ts, ts_up = ts_up, wan_up = M.wan_up(), threshold = threshold,
 		status = state.status, notice = M.clean_notice(state.notice),
@@ -1681,22 +1755,31 @@ function M.tz_mismatch_report(state)
 	return #bad .. (#parts > 0 and (":" .. table.concat(parts, ",")) or "")
 end
 
+-- 这台设备的 MAC 和租约里的名字（查不到返回 nil）：上网设置页和检测弹窗共用
+function M.client_mac_name(ip)
+	if not M.is_ipv4(ip or "") then return nil end
+	local mac
+	for line in (M.env.read("/proc/net/arp") or ""):gmatch("[^\n]+") do
+		local aip, amac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+		if aip == ip then mac = amac:lower() end
+	end
+	if not mac then return nil end
+	local name
+	for line in (M.env.read("/tmp/dhcp.leases") or ""):gmatch("[^\n]+") do
+		local lmac, lname = line:match("^%d+%s+(%S+)%s+%S+%s+(%S+)")
+		if lmac and lmac:lower() == mac and lname ~= "*" then name = lname:gsub("[^%w%-_.]", ""):sub(1, 20) end
+	end
+	return mac, name
+end
+
 -- 上网设置页报来一台设备的时区。返回 { ok, zone, label } 或 nil, 原因；状态变了（对↔错）马上同步一次
 function M.record_client_tz(ip, tz, offset)
 	if not M.is_ipv4(ip or "") then return nil, "ip" end
 	if type(tz) ~= "string" or #tz > 40 or not tz:match("^[%w_/+%-]+$") then return nil, "tz" end
 	offset = tonumber(offset)
 	if not offset or offset < -840 or offset > 840 then return nil, "offset" end
-	local mac, name
-	for line in (M.env.read("/proc/net/arp") or ""):gmatch("[^\n]+") do
-		local aip, amac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
-		if aip == ip then mac = amac:lower() end
-	end
+	local mac, name = M.client_mac_name(ip)
 	if not mac then return nil, "mac" end
-	for line in (M.env.read("/tmp/dhcp.leases") or ""):gmatch("[^\n]+") do
-		local lmac, lname = line:match("^%d+%s+(%S+)%s+%S+%s+(%S+)")
-		if lmac and lmac:lower() == mac and lname ~= "*" then name = lname:gsub("[^%w%-_.]", ""):sub(1, 20) end
-	end
 	local state = M.read_json(M.STATE_FILE) or {}
 	local zone = type(state.tz_zone) == "string" and state.tz_zone ~= "" and state.tz_zone or nil
 	local router_offset = M.router_offset()
@@ -1720,6 +1803,59 @@ function M.record_client_tz(ip, tz, offset)
 		M.env.run("( sleep 2; /usr/bin/fleet-agent --now ) >/dev/null 2>&1 &")
 	end
 	return { ok = (zone == nil) or ok, zone = zone or "", label = type(state.tz_label) == "string" and state.tz_label or "" }
+end
+
+-- 检测弹窗按设备记录：{ mac = { ts = 上次弹出的时间, opted_out = 是否不再提示, name, tz, lang } }
+-- 弹窗被展示（302 时）就算弹过；“完成”也记一次；“不再提示”记 opted_out。
+-- 认不出是哪台设备（ARP 里没这台）：不弹，免得每次连网都弹
+function M.portal_due(ip, now)
+	now = now or M.env.now()
+	local mac = M.client_mac_name(ip)
+	if not mac then return false end
+	local clients = M.read_json(M.PORTAL_CLIENTS) or {}
+	local e = clients[mac]
+	if type(e) ~= "table" then return true end
+	if e.opted_out == true then return false end
+	return now - (tonumber(e.ts) or 0) >= M.PORTAL_INTERVAL
+end
+
+-- 记一次弹窗：kind 是 shown（展示时）、done（点“完成”时）或 optout（点“不再提示”时）
+function M.record_portal(ip, kind, tz, lang)
+	local mac, name = M.client_mac_name(ip)
+	if not mac then return nil, "mac" end
+	local now = M.env.now()
+	local clients = M.read_json(M.PORTAL_CLIENTS) or {}
+	for k, e in pairs(clients) do
+		if type(e) ~= "table" or now - (tonumber(e.ts) or 0) >= M.PORTAL_DAYS * 86400 then clients[k] = nil end
+	end
+	local e = clients[mac] or {}
+	e.ts = now
+	if name then e.name = name end
+	if kind == "optout" then e.opted_out = true end
+	if type(tz) == "string" and #tz <= 40 and tz:match("^[%w_/+%-]+$") then e.tz = tz end
+	if type(lang) == "string" and #lang <= 20 and lang:match("^[%w%-]+$") then e.lang = lang end
+	clients[mac] = e
+	M.write_json(M.PORTAL_CLIENTS, clients)
+	return true
+end
+
+-- 给检测弹窗页看的路由器侧状态（不含任何密钥）
+function M.portal_status()
+	local state = M.read_json(M.STATE_FILE) or {}
+	local last = M.read_json(M.LAST_FILE)
+	local cfg = last and M.validate(last) or nil
+	return {
+		egress = (type(state.egress) == "string" and M.is_ipv4(state.egress)) and state.egress or "",
+		chain = type(state.chain) == "string" and state.chain or "",
+		status = type(state.status) == "string" and state.status or "",
+		expire_at = tonumber(state.expire_at),
+		udp = cfg and cfg.udp or nil,
+		ipv6_blocked = true, -- 路由规则先拦全部 IPv6（隧道里的 IPv6 会从机房出口漏出去），固件只用 IPv4
+		domain_block = cfg and cfg.domain_block == true,
+		tz_zone = type(state.tz_zone) == "string" and state.tz_zone or "",
+		tz_label = type(state.tz_label) == "string" and state.tz_label or "",
+		firmware = M.firmware_version(),
+	}
 end
 
 -- 给“上网设置”页看的状态（不含任何密钥）

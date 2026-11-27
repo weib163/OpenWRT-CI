@@ -546,7 +546,7 @@ class RunTests(unittest.TestCase):
         self.assertTrue(self.last_url.startswith("http://100.64.0.9:8080/v1/config?"))
         q = self.query()
         self.assertEqual((q["ver"], q["fw"], q["build"], q["agent"], q["board"], q["ts"], q["pw"], q["err"], q["px"]),
-                         ("", FW_OLD, BUILD_OLD, "1.4.1", BOARD, "1.90.6", "1.14.4", "", ""))
+                         ("", FW_OLD, BUILD_OLD, "1.4.2", BOARD, "1.90.6", "1.14.4", "", ""))
         self.assertEqual((q["ws"], q["wk"]), ("OWRT", "12345678"))
         self.assertEqual(self.h.restarts, 1)
         self.assertEqual(self.h.dnsmasq_restarts, 1)
@@ -1248,6 +1248,111 @@ class HealthTests(unittest.TestCase):
         self.assertFalse(self.h.M.wan_up())
         del self.h.files["/proc/net/route"]
         self.assertIsNone(self.h.M.wan_up())
+
+
+class PortalTests(unittest.TestCase):
+    ARP = ("IP address       HW type     Flags       HW address            Mask     Device\n"
+           "192.168.10.50    0x1         0x2         aa:bb:cc:dd:ee:01     *        br-lan\n"
+           "192.168.10.51    0x1         0x2         aa:bb:cc:dd:ee:02     *        br-lan\n")
+    LEASES = "1800003600 aa:bb:cc:dd:ee:01 192.168.10.50 iPhone-Li 01:aa\n"
+
+    def setUp(self):
+        self.h = AgentHarness()
+        self.h.files["/proc/net/arp"] = self.ARP
+        self.h.files["/tmp/dhcp.leases"] = self.LEASES
+
+    def portal_records(self):
+        return json.loads(self.h.files.get("/etc/fleet/portal-clients.json", "{}"))
+
+    def test_probe_response(self):
+        M = self.h.M
+        self.assertEqual(M.probe_response("captive.apple.com"), (200, "text/html", "Success\n"))
+        self.assertEqual(M.probe_response("connectivitycheck.gstatic.com"), (204, None, ""))
+        self.assertEqual(M.probe_response("www.gstatic.com"), (204, None, ""))
+        self.assertEqual(M.probe_response("clients3.google.com"), (204, None, ""))
+        self.assertEqual(M.probe_response("www.msftconnecttest.com"), (200, "text/plain", "Microsoft Connect Test\n"))
+        self.assertEqual(M.probe_response("www.msftncsi.com"), (200, "text/plain", "Microsoft NCSI\n"))
+        self.assertEqual(M.probe_response("detectportal.firefox.com"), (200, "text/plain", "success\n"))
+        self.assertIsNone(M.probe_response("example.com"))
+        self.assertIsNone(M.probe_response("captive.apple.com.evil.com"))
+        self.assertEqual(M.probe_response("CAPTIVE.APPLE.COM"), (200, "text/html", "Success\n"))  # 大小写不敏感
+        self.assertEqual(M.probe_response("captive.apple.com:80"), (200, "text/html", "Success\n"))  # 带端口也认
+
+    def test_portal_due_and_record(self):
+        M, h = self.h.M, self.h
+        # 没记过：弹；认不出是哪台设备（ARP 里没有）：不弹
+        self.assertTrue(M.portal_due("192.168.10.50"))
+        self.assertFalse(M.portal_due("192.168.10.99"))
+        self.assertEqual(M.record_portal("192.168.10.99", "shown"), (None, "mac"))
+        # 展示（302）就算弹过
+        self.assertTrue(M.record_portal("192.168.10.50", "shown"))
+        self.assertFalse(M.portal_due("192.168.10.50"))
+        # 23 小时后：还不弹；25 小时后：弹
+        h.now += 23 * 3600
+        self.assertFalse(M.portal_due("192.168.10.50"))
+        h.now += 2 * 3600
+        self.assertTrue(M.portal_due("192.168.10.50"))
+        # 完成：记时区和语言
+        self.assertTrue(M.record_portal("192.168.10.50", "done", "America/Los_Angeles", "en-US"))
+        rec = self.portal_records()["aa:bb:cc:dd:ee:01"]
+        self.assertEqual((rec["tz"], rec["lang"], rec["name"]), ("America/Los_Angeles", "en-US", "iPhone-Li"))
+        self.assertFalse(M.portal_due("192.168.10.50"))
+        # 格式不对的时区/语言不记（原来的还在）
+        M.record_portal("192.168.10.50", "done", "a b", "en_US!")
+        rec = self.portal_records()["aa:bb:cc:dd:ee:01"]
+        self.assertEqual((rec["tz"], rec["lang"]), ("America/Los_Angeles", "en-US"))
+        # 不再提示：以后都不弹
+        self.assertTrue(M.record_portal("192.168.10.50", "optout"))
+        h.now += 30 * 86400
+        self.assertFalse(M.portal_due("192.168.10.50"))
+        # 30 天没再检测的记录作废（另一台设备）
+        M.record_portal("192.168.10.51", "shown")
+        h.now += 31 * 86400
+        self.assertTrue(M.portal_due("192.168.10.51"))
+
+    def test_ensure_portal_dns(self):
+        h, c = self.h, self.h.cursor
+        # 没有内网地址：不动
+        self.assertFalse(h.M.ensure_portal_dns(c, None))
+        # 加上 7 个探测域名
+        self.assertTrue(h.M.ensure_portal_dns(c, "192.168.10.1"))
+        sec = [s for s in h.uci("dhcp") if s[".name"] == "cfg01411c"][0]
+        self.assertEqual(sec["address"], ["/" + d + "/192.168.10.1" for d in h.to_py(h.M.PROBE_DOMAINS)])
+        # 再跑一次：没变化，不提交
+        n = c.commits
+        self.assertFalse(h.M.ensure_portal_dns(c, "192.168.10.1"))
+        self.assertEqual(c.commits, n)
+        # 内网地址改了：跟着改
+        self.assertTrue(h.M.ensure_portal_dns(c, "192.168.2.1"))
+        sec = [s for s in h.uci("dhcp") if s[".name"] == "cfg01411c"][0]
+        self.assertEqual(sec["address"], ["/" + d + "/192.168.2.1" for d in h.to_py(h.M.PROBE_DOMAINS)])
+        # 别的 address 项原样保留，旧的探测域名项去掉
+        h.set_uci("dhcp", "cfg01411c", "address", ["/example.com/1.2.3.4", "/captive.apple.com/192.168.10.1"])
+        self.assertTrue(h.M.ensure_portal_dns(c, "192.168.10.1"))
+        sec = [s for s in h.uci("dhcp") if s[".name"] == "cfg01411c"][0]
+        self.assertEqual(sec["address"],
+                         ["/example.com/1.2.3.4"] + ["/" + d + "/192.168.10.1" for d in h.to_py(h.M.PROBE_DOMAINS)])
+
+    def test_portal_status(self):
+        h = self.h
+        # 没状态：空值，不报错
+        info = h.to_py(h.M.portal_status())
+        self.assertEqual((info["egress"], info["chain"], info["status"]), ("", "", ""))
+        self.assertTrue(info["ipv6_blocked"])
+        # 有状态和配置
+        h.files["/etc/openwrt_version"] = "1.4.2-26.11.28\n"
+        h.files["/etc/fleet/state.json"] = json.dumps({
+            "status": "active", "chain": "ok", "egress": "203.0.113.50",
+            "expire_at": 1798761600, "tz_zone": "America/Los_Angeles", "tz_label": "UTC-8"})
+        last = resp("active")
+        last["domain_block"] = True
+        h.files["/etc/fleet/last.json"] = json.dumps(last)
+        info = h.to_py(h.M.portal_status())
+        self.assertEqual((info["egress"], info["chain"], info["status"], info["expire_at"]),
+                         ("203.0.113.50", "ok", "active", 1798761600))
+        self.assertEqual((info["tz_zone"], info["tz_label"]), ("America/Los_Angeles", "UTC-8"))
+        self.assertEqual((info["udp"], info["domain_block"]), (True, True))
+        self.assertEqual(info["firmware"], "1.4.2-26.11.28")
 
 
 class NoticeTests(unittest.TestCase):

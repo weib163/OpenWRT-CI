@@ -95,6 +95,21 @@ PIN_SING_BOX() {
 
 PIN_SING_BOX || exit 1
 
+# sing-box 补丁按稳定版锁死：软件源（viking）里的补丁跟测试版（alpha）走，
+# 2026-11-27 软件源把 100-fix-dns-tcp-close.patch 换成了测试版用的写法，
+# 和锁死的稳定版 1.14.4 对不上，编译直接断在这里。
+# 所以用仓库里存的 1.14.4 版补丁（取自软件源 2026-10-25 的提交 3d0d9c46）
+# 覆盖软件源的同名文件；不要把版本升到测试版，也不要删补丁。
+SING_BOX_PATCH_SRC="$GITHUB_WORKSPACE/Scripts/sing-box-patches/100-fix-dns-tcp-close.patch"
+SING_BOX_PATCH_DST="./package/packages/sing-box/patches/100-fix-dns-tcp-close.patch"
+if [ ! -f "$SING_BOX_PATCH_SRC" ]; then
+	echo "没找到锁死的 sing-box 补丁（$SING_BOX_PATCH_SRC）"
+	exit 1
+fi
+mkdir -p "$(dirname "$SING_BOX_PATCH_DST")"
+cp -f "$SING_BOX_PATCH_SRC" "$SING_BOX_PATCH_DST" || exit 1
+echo "sing-box 补丁已换成 1.14.4 版"
+
 UPDATE_PACKAGE "diskman" "sbwml/luci-app-diskman" "main"
 UPDATE_PACKAGE "mosdns" "sbwml/luci-app-mosdns" "v5" "" "v2dat"
 UPDATE_PACKAGE "openlist2" "sbwml/luci-app-openlist2" "main"

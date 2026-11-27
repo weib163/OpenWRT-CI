@@ -168,12 +168,13 @@ cat > "$FILES_DIR/etc/uci-defaults/93-fleet-wifi" <<'EOF'
 exit 0
 EOF
 
-# 升级时保留：fleet 设置（WiFi 状态在里面）、上次的下发配置和代理配置。别的 /etc/fleet 文件跟着新固件走
+# 升级时保留：fleet 设置（WiFi 状态在里面）、上次的下发配置和代理配置、检测弹窗的按设备记录（丢了会每台设备重弹一次）。别的 /etc/fleet 文件跟着新固件走
 cat > "$FILES_DIR/lib/upgrade/keep.d/fleet" <<'EOF'
 /etc/config/fleet
 /etc/fleet/last.json
 /etc/fleet/state.json
 /etc/fleet/proxy.json
+/etc/fleet/portal-clients.json
 EOF
 
 cat > "$FILES_DIR/etc/init.d/fleet-agent" <<'EOF'
@@ -279,6 +280,7 @@ EOF
 # 上网设置页：独立的 uhttpd（81 端口），家里打开 http://路由器地址（80 端口）由防火墙转过来
 mkdir -p "$FILES_DIR/www/fleet-setup/cgi-bin" "$FILES_DIR/www/fleet-setup/pay"
 install -m 644 "$SRC/setup-page.html" "$FILES_DIR/www/fleet-setup/index.html"
+install -m 644 "$SRC/portal.html" "$FILES_DIR/www/fleet-setup/portal.html"
 cat > "$FILES_DIR/www/fleet-setup/cgi-bin/api" <<'EOF'
 #!/usr/bin/lua
 dofile("/usr/share/fleet/fleet-setup.lua").cgi()
@@ -303,6 +305,9 @@ uci set uhttpd.fleetsetup.tcp_keepalive='1'
 uci set uhttpd.fleetsetup.no_dirlists='1'
 uci set uhttpd.fleetsetup.rfc1918_filter='1'
 uci set uhttpd.fleetsetup.redirect_https='0'
+# 连通性探测（手机连 WiFi 时发的那几个）没有对应的文件：uhttpd 按这个地址找处理程序，
+# 探测请求就到了 /cgi-bin/api?a=probe，由它决定弹检测页还是回探测要的成功响应
+uci set uhttpd.fleetsetup.error_page='/cgi-bin/api?a=probe'
 uci commit uhttpd
 
 # 家里打开 http://路由器地址（80 端口）→ 上网设置页（81 端口）。内网地址改了 fleet-agent 会跟着改这条

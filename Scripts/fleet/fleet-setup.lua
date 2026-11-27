@@ -374,9 +374,48 @@ end
 -- req：{ method, action, host, origin, content_type, length, auth, body（JSON 请求才有） }
 -- 返回 HTTP 状态码, 回复（Lua 表）
 function M.handle(req)
+	-- 连通性探测（uhttpd 的 404 处理送来的，见 Fleet.sh 的 error_page）：只认 GET；
+	-- 探测域名不在 host_ok 的白名单里，所以这条分支放最前面
+	if req.action == "probe" and req.method == "GET" then return M.probe(req) end
 	if not M.host_ok(req.host) then return 403, { error = "bad_host" } end
 	local action = req.action
 	local authed, token = M.session_ok(req.auth)
+
+	if action == "status" and req.method == "GET" then
+		local info = agent.status_info()
+		info.wan_proto = agent.env.cursor():get("network", "wan", "proto") or ""
+		info.logged_in = authed
+		return 200, info
+	end
+
+	if action == "portal-status" and req.method == "GET" then
+		-- 检测页要的路由器侧状态（不用登录；不含任何密钥）
+		return 200, agent.portal_status()
+	end
+
+	if action == "portal-done" then
+		-- 检测页点“完成”：记一次（一天内不再弹），时区照 tzcheck 的路子记
+		if not M.write_ok(req, "application/json") then return 403, { error = "csrf" } end
+		local body = type(req.body) == "table" and req.body or {}
+		local lang = body.lang
+		if lang ~= nil and (type(lang) ~= "string" or #lang > 20 or not lang:match("^[%w%-]+$")) then
+			return 400, { error = "lang" }
+		end
+		if body.tz ~= nil or body.offset ~= nil then
+			local res, why = agent.record_client_tz(req.remote, body.tz, body.offset)
+			-- 时区格式不对才 400；ARP 里查不到这台设备只是记不上，不卡用户
+			if not res and why ~= "mac" then return 400, { error = why } end
+		end
+		agent.record_portal(req.remote, "done", body.tz, lang)
+		return 200, { ok = true }
+	end
+
+	if action == "portal-optout" then
+		-- 检测页点“这台设备不再提示”：以后不再弹
+		if not M.write_ok(req, "application/json") then return 403, { error = "csrf" } end
+		agent.record_portal(req.remote, "optout")
+		return 200, { ok = true }
+	end
 
 	if action == "status" and req.method == "GET" then
 		local info = agent.status_info()
@@ -441,15 +480,40 @@ function M.handle(req)
 	return 404, { error = "not_found" }
 end
 
-local REASONS = { [200] = "OK", [400] = "Bad Request", [401] = "Unauthorized", [403] = "Forbidden",
+local REASONS = { [200] = "OK", [204] = "No Content", [302] = "Found", [400] = "Bad Request", [401] = "Unauthorized", [403] = "Forbidden",
 	[404] = "Not Found", [413] = "Payload Too Large", [429] = "Too Many Requests", [500] = "Internal Server Error",
 	[503] = "Service Unavailable" }
+
+-- 连通性探测（uhttpd 的 404 处理把探测请求送到这里）：
+-- 该弹检测页就 302 到检测页（同时记一次弹出）；否则回探测本来要的成功响应。
+-- 返回 code, body, raw：raw 有值时 cgi() 用 respond_raw 回非 JSON 响应。
+function M.probe(req)
+	local status, ctype, body = agent.probe_response(req.host)
+	if not status then return 404, { error = "not_found" } end
+	if agent.portal_due(req.remote) then
+		agent.record_portal(req.remote, "shown")
+		local lan = M.lan_ip(agent.env.cursor())
+		local loc = lan and ("http://" .. lan .. "/portal.html") or "/portal.html"
+		return 302, {}, { location = loc }
+	end
+	return status, {}, { content_type = ctype, body = body }
+end
 
 function M.respond(code, body)
 	local data = agent.encode_json(body)
 	M.env.write_stdout(string.format("Status: %d %s\r\nContent-Type: application/json; charset=utf-8\r\n"
 		.. "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Length: %d\r\n\r\n%s",
 		code, REASONS[code] or "OK", #data, data))
+end
+
+-- 非 JSON 响应（连通性探测的 204 / 302 / 200 纯文本）：状态行 + 头 + 体
+function M.respond_raw(code, raw)
+	local body = raw.body or ""
+	local head = string.format("Status: %d %s\r\nCache-Control: no-store\r\n", code, REASONS[code] or "OK")
+	if raw.location then head = head .. "Location: " .. raw.location .. "\r\n" end
+	if raw.content_type then head = head .. "Content-Type: " .. raw.content_type .. "; charset=utf-8\r\n" end
+	head = head .. string.format("Content-Length: %d\r\n\r\n", #body)
+	M.env.write_stdout(head .. body)
 end
 
 function M.cgi()
@@ -475,13 +539,13 @@ function M.cgi()
 		local ok, v = pcall(json().parse, raw or "")
 		req.body = ok and type(v) == "table" and v or {}
 	end
-	local ok, code, body = pcall(M.handle, req)
+	local ok, code, body, raw = pcall(M.handle, req)
 	if not ok then
 		agent.env.log("上网设置页出错：" .. tostring(code))
 		M.respond(500, { error = "internal" })
 		return
 	end
-	M.respond(code, body)
+	if raw then M.respond_raw(code, raw) else M.respond(code, body) end
 end
 
 return M
