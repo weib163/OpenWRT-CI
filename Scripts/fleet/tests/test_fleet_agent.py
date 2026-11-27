@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import unittest
+import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import TS_STATUS, AgentHarness, load_fixtures  # noqa: E402
@@ -40,15 +41,16 @@ class ValidateTests(unittest.TestCase):
         self.assertEqual(py["direct"], ["hs.example.com", "198.51.100.7"])
         self.assertEqual((py["udp"], py["global"], py["has_residential"], py["expire_at"]), (True, False, True, 1798761600))
         self.assertEqual(py["timezone"], {"zone": "America/Los_Angeles", "posix": "PST8PDT,M3.2.0,M11.1.0", "label": "UTC-8"})
-        self.assertEqual([f["name"] for f in py["pay"]["files"]], ["wechat.png", "alipay.jpg"])
+        self.assertEqual([f["name"] for f in py["pay"]["files"]], ["wechat.png", "alipay.jpg", "service.png"])
+        self.assertIn("fleet-help", py["pay"]["contact"])
         for name in ("pending", "expired", "limited", "disabled", "no_nodes", "unchanged", "active_no_udp",
                      "active_global", "noip", "active_plain", "active_half_hour_tz", "notice"):
             self.assertIsNotNone(self.h.validate(resp(name))[0], name)
         # 到期、待开通的回复也带收款码、到期时间、时区（客户最需要看到收款码）
         exp = self.h.to_py(self.h.validate(resp("expired"))[0])
         self.assertEqual((exp["expire_at"], exp["timezone"]["zone"], len(exp["pay"]["files"])),
-                         (1798761600, "America/Los_Angeles", 2))
-        self.assertEqual(len(self.h.to_py(self.h.validate(resp("pending"))[0])["pay"]["files"]), 2)
+                         (1798761600, "America/Los_Angeles", 3))
+        self.assertEqual(len(self.h.to_py(self.h.validate(resp("pending"))[0])["pay"]["files"]), 3)
 
     def test_rejects_bad_or_malicious_fields(self):
         good = resp("active")
@@ -85,6 +87,7 @@ class ValidateTests(unittest.TestCase):
                 r["timezone"][key] = value
             self.assertIsNone(self.h.validate(r)[0], "timezone.%s=%r 应该被拒绝" % (key, value))
         bad_pay = [("version", "XYZ"), ("version", ""), ("text", "a\x01b"), ("text", "x" * 1501), ("files", "a.png"),
+                   ("contact", "a\x02"), ("contact", "x" * 601), ("contact", 5),
                    ("files", [{"name": "x.png", "sha256": "0" * 64, "size": 1}] * 5)]
         for key, value in bad_pay:
             r = copy.deepcopy(good)
@@ -525,7 +528,9 @@ class RunTests(unittest.TestCase):
         self.assertEqual(self.h.files["/www/fleet-setup/pay/wechat.png"], self.pay_images["wechat.png"])
         self.assertEqual(self.h.files["/www/fleet-setup/pay/alipay.jpg"], self.pay_images["alipay.jpg"])
         info = json.loads(self.h.files["/www/fleet-setup/pay/info.json"])
-        self.assertEqual((info["version"], info["files"]), (r["pay"]["version"], ["wechat.png", "alipay.jpg"]))
+        self.assertEqual((info["version"], info["files"]), (r["pay"]["version"], ["wechat.png", "alipay.jpg", "service.png"]))
+        self.assertIn("fleet-help", info["contact"])
+        self.assertEqual(self.h.files["/www/fleet-setup/pay/service.png"], self.pay_images["service.png"])
         self.assertIn("付款时备注设备码", info["text"])
         self.assertTrue(any("出口 IP：203.0.113.50" in m for m in self.h.logs))
         r2 = copy.deepcopy(r)
@@ -535,7 +540,7 @@ class RunTests(unittest.TestCase):
         q = self.query()
         self.assertEqual((q["ver"], q["px"], q["eg"]), (r["version"], "ok", "203.0.113.50"))
         self.assertEqual((self.h.restarts, self.h.dnsmasq_restarts, self.h.screen_restarts), (1, 1, 1))
-        self.assertEqual(len(self.pay_downloads), 2)  # 收款码版本没变：不再下载
+        self.assertEqual(len(self.pay_downloads), 3)  # 收款码版本没变：不再下载
         self.assertEqual(json.loads(self.h.files["/etc/fleet/state.json"])["tz_at"], self.h.now)
 
     def test_pay_codes_follow_server(self):
@@ -692,12 +697,57 @@ class RunTests(unittest.TestCase):
         res = self.h.M.paid("alipay")
         self.assertEqual(res[1] if isinstance(res, tuple) else None, "no_tailscale")
 
+    def test_support_qr(self):
+        qr = base64.b64decode(FX["support_qr"])
+        got = []
+
+        def download(cmd):
+            path, url = re.findall(r"'([^']*)'", cmd)[:2]
+            got.append(url)
+            self.h.files[path] = qr
+            return 0
+        self.h.run_map["uclient-fetch -q -T 30 -O '/tmp/fleet/kf.png'"] = download
+        self.h.exec_map = dict({"wc -c < '/tmp/fleet/kf.png'": self._size_and_hash}, **self.h.exec_map)
+
+        def mv(cmd):
+            src, dst = re.findall(r"'([^']*)'", cmd)[:2]
+            self.h.files[dst] = self.h.files.pop(src)
+            return 0
+        self.h.run_map["mkdir -p /www/fleet-setup && mv -f "] = mv
+        r = resp("active")
+        self.serve(r)
+        self.h.main()
+        self.assertEqual(got, ["http://100.64.0.9:8080/v1/support-qr.png"])
+        self.assertEqual(self.h.files["/www/fleet-setup/kf.png"], qr)
+        info = self.h.to_py(self.h.M.status_info())
+        self.assertEqual(info["support_url"], "https://kf.example.com/?d=4D5E6F")
+        self.serve(resp("unchanged") | {"version": r["version"]})
+        self.h.main()
+        self.assertEqual(len(got), 1)  # 没变：不再下载
+        # 服务器关了客服网站：二维码去掉，页面退回直接显示收款码
+        r2 = copy.deepcopy(r)
+        r2["version"] = "9" * 16
+        del r2["support"]
+        self.serve(r2)
+        self.h.main()
+        self.assertNotIn("/www/fleet-setup/kf.png", self.h.files)
+        self.assertEqual(self.h.to_py(self.h.M.status_info())["support_url"], "")
+
+    def test_bad_support_block_rejected(self):
+        for change in ({"url": "http://kf.example.com/?d=4D5E6F"}, {"url": "https://kf.example.com/x?d=1"},
+                       {"url": "https://evil.com/?d=12;reboot"}, {"qr": {"sha256": "ab", "size": 10}},
+                       {"qr": {"sha256": "0" * 64, "size": 900000}}):
+            r = copy.deepcopy(resp("active"))
+            r["support"].update(change)
+            self.assertIsNone(self.h.validate(r)[0], change)
+
     def test_status_info_for_setup_page(self):
         self.serve(resp("active"))
         self.h.main()
         info = self.h.to_py(self.h.M.status_info())
         self.assertEqual((info["status"], info["chain"], info["expire_at"], info["tz"]), ("active", "ok", 1798761600, "UTC-8"))
-        self.assertEqual((info["pay_files"], info["ssid"]), (["wechat.png", "alipay.jpg"], "OWRT"))
+        self.assertEqual((info["pay_files"], info["ssid"]), (["wechat.png", "alipay.jpg", "service.png"], "OWRT"))
+        self.assertIn("fleet-help", info["contact"])
         self.assertEqual(info["device"], "4D5E6F")  # 拿不到设备名时用 br-lan 的 MAC
         self.assertNotIn("12345678", json.dumps(info))  # 不带 WiFi 密码
 

@@ -223,6 +223,10 @@ function M.validate_pay(p)
 	if text ~= nil and (type(text) ~= "string" or #text > 1500 or text:find("[%z\1-\9\11-\31\127]")) then
 		return nil, "text"
 	end
+	local contact = p.contact
+	if contact ~= nil and (type(contact) ~= "string" or #contact > 600 or contact:find("[%z\1-\9\11-\31\127]")) then
+		return nil, "contact"
+	end
 	local files = {}
 	if type(p.files) ~= "table" or #p.files > 4 then return nil, "files" end
 	for _, f in ipairs(p.files) do
@@ -235,7 +239,20 @@ function M.validate_pay(p)
 		if not size or size < 1 or size > 1048576 then return nil, "files.size" end
 		files[#files + 1] = { name = name, sha256 = sha:lower(), size = math.floor(size) }
 	end
-	return { version = version:lower(), text = text or "", files = files }
+	return { version = version:lower(), text = text or "", contact = contact or "", files = files }
+end
+
+-- 客服网站：地址（https://kf.域名/?d=设备码）和这台的二维码图片（另外下载，按 sha256 核对）
+M.SUPPORT_QR = "/www/fleet-setup/kf.png"
+M.SUPPORT_INFO = "/www/fleet-setup/kf.json"
+function M.validate_support(v)
+	if type(v) ~= "table" or type(v.qr) ~= "table" then return nil, "不是对象" end
+	local url = str(v.url)
+	if not url or #url > 200 or not url:match("^https://[%w%.%-]+/%?d=[%x]+$") then return nil, "url" end
+	local sha, size = str(v.qr.sha256), tonumber(v.qr.size)
+	if not sha or #sha ~= 64 or not sha:match("^%x+$") then return nil, "qr.sha256" end
+	if not size or size < 1 or size > 200000 then return nil, "qr.size" end
+	return { url = url, qr = { sha256 = sha:lower(), size = math.floor(size) } }
 end
 
 local function bool_or(v, default)
@@ -280,6 +297,11 @@ function M.validate(r)
 		local tz, why = M.validate_timezone(r.timezone)
 		if not tz then return nil, "timezone 不合法：" .. why end
 		out.timezone = tz
+	end
+	if r.support ~= nil then
+		local sup, why = M.validate_support(r.support)
+		if not sup then return nil, "support 不合法：" .. why end
+		out.support = sup
 	end
 	if r.pay ~= nil then
 		local pay, why = M.validate_pay(r.pay)
@@ -1134,7 +1156,34 @@ function M.sync_pay(base, pay)
 			M.env.remove(M.PAY_DIR .. "/" .. old)
 		end
 	end
-	M.write_json(info_path, { version = want_version, text = pay and pay.text or "", files = list })
+	M.write_json(info_path, { version = want_version, text = pay and pay.text or "", contact = pay and pay.contact or "",
+		files = list })
+	return true
+end
+
+-- 客服二维码：地址或图片变了才下载，核对大小和 sha256。返回 changed, 错误
+function M.sync_support(base, sup)
+	local cur = M.read_json(M.SUPPORT_INFO)
+	if not sup then
+		if cur or M.env.exists(M.SUPPORT_QR) then
+			M.env.remove(M.SUPPORT_QR)
+			M.env.remove(M.SUPPORT_INFO)
+			return true
+		end
+		return false
+	end
+	if cur and cur.url == sup.url and cur.sha256 == sup.qr.sha256 and M.env.exists(M.SUPPORT_QR) then return false end
+	local tmp = "/tmp/fleet/kf.png"
+	M.env.remove(tmp)
+	if not M.download(base .. "/v1/support-qr.png", tmp, 30) then return false, "下载客服二维码失败" end
+	local out = M.env.exec("wc -c < " .. shell_quote(tmp) .. " 2>/dev/null; sha256sum " .. shell_quote(tmp) .. " 2>/dev/null")
+	local size, sum = out:match("^%s*(%d+)%s+(%x+)")
+	if tonumber(size) ~= sup.qr.size or (sum or ""):lower() ~= sup.qr.sha256 then
+		M.env.remove(tmp)
+		return false, "客服二维码校验不对"
+	end
+	M.env.run("mkdir -p /www/fleet-setup && mv -f " .. shell_quote(tmp) .. " " .. shell_quote(M.SUPPORT_QR))
+	M.write_json(M.SUPPORT_INFO, { url = sup.url, sha256 = sup.qr.sha256 })
 	return true
 end
 
@@ -1364,6 +1413,15 @@ function M.run(opts)
 		end
 	end
 
+	if full then
+		local sok, schanged, serr = pcall(M.sync_support, base, cfg.support)
+		if not sok or serr then
+			M.env.log("客服二维码没更新：" .. tostring(sok and serr or schanged))
+		elseif schanged then
+			M.env.log(cfg.support and "客服二维码已更新" or "客服二维码已去掉")
+		end
+	end
+
 	local unchanged = resp.status == "unchanged"
 	local expire_at = tonumber(state.expire_at)
 	if full then expire_at = cfg.expire_at end
@@ -1555,6 +1613,7 @@ function M.status_info()
 	local state = M.read_json(M.STATE_FILE) or {}
 	local ssid = M.wifi_info(c)
 	local pay = M.read_json(M.PAY_DIR .. "/info.json")
+	local support = M.read_json(M.SUPPORT_INFO)
 	local files = array()
 	for _, name in ipairs((pay and type(pay.files) == "table") and pay.files or {}) do
 		if type(name) == "string" and name:match("^[%w_%-]+%.[pj][np]g$") then files[#files + 1] = name end
@@ -1572,6 +1631,9 @@ function M.status_info()
 		tz_zone = type(state.tz_zone) == "string" and state.tz_zone or "",
 		ssid = ssid or "",
 		pay_text = (pay and type(pay.text) == "string") and pay.text or "",
+		contact = (pay and type(pay.contact) == "string") and pay.contact or "",
+		support_url = (M.env.exists(M.SUPPORT_QR) and type(support) == "table" and type(support.url) == "string")
+			and support.url or "",
 		pay_files = files,
 		pay_version = (pay and type(pay.version) == "string") and pay.version or "",
 	}

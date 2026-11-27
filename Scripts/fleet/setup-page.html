@@ -24,11 +24,22 @@ label.radio{display:inline-flex;align-items:center;gap:4px;margin-right:14px}lab
 
 <div class="card"><h2>状态</h2><div id="status" class="muted">读取中…</div></div>
 
+<div class="card hide" id="kfcard"><h2>客服 · 续费 · 售后 · 问题反馈</h2>
+<div class="small muted">用手机微信或相机扫码，打开客服网站：续费付款、联系客服、报修、提交问题都在里面（已经带上这台的设备码）。</div>
+<div class="qrs"><div class="qr"><img id="kfqr" alt="客服二维码"><div>扫码联系客服</div></div></div>
+<div class="small muted" style="text-align:center;word-break:break-all">扫不了就用手机浏览器打开：<span id="kfurl"></span></div>
+</div>
+
 <div class="card hide" id="paycard"><h2>续费 / 开通</h2>
 <div class="paytext" id="paytext"></div>
 <div class="note">付款时请在备注里写设备码 <b id="paycode">------</b>，付完点下面对应的“我已付款”。确认收款后 1 分钟内自动恢复。</div>
 <div class="qrs" id="qrs"></div>
 <div class="msg" id="paymsg"></div>
+</div>
+
+<div class="card hide" id="contactcard"><h2>联系客服</h2>
+<div class="paytext" id="contacttext"></div>
+<div class="qrs" id="serviceqr"></div>
 </div>
 
 <div class="card" id="logincard"><h2>宽带设置、手动升级</h2>
@@ -99,8 +110,23 @@ function renderStatus(s){
 }
 let payVersion=null;
 function renderPay(s){
-  const files=Array.isArray(s.pay_files)?s.pay_files:[];
-  if(!files.length&&!s.pay_text){$("paycard").classList.add("hide");return}
+  // 服务器开了客服网站：页面上只放一个二维码，续费、客服、售后、反馈都在网站上
+  if(s.support_url){
+    $("kfcard").classList.remove("hide");$("paycard").classList.add("hide");$("contactcard").classList.add("hide");
+    $("kfurl").textContent=s.support_url;
+    if($("kfqr").dataset.u!==s.support_url){$("kfqr").dataset.u=s.support_url;$("kfqr").src="/kf.png?u="+encodeURIComponent(s.support_url)}
+    return;
+  }
+  $("kfcard").classList.add("hide");
+  const all=Array.isArray(s.pay_files)?s.pay_files:[];
+  const files=all.filter(n=>!n.startsWith("service"));
+  const svc=all.filter(n=>n.startsWith("service"));
+  $("contactcard").classList.toggle("hide",!svc.length&&!s.contact);
+  $("contacttext").textContent=s.contact||"";
+  if(payVersion!==s.pay_version){const q=$("serviceqr");q.replaceChildren();
+    for(const name of svc){const d=document.createElement("div");d.className="qr";const img=document.createElement("img");img.alt="客服二维码";
+      img.src="/pay/"+encodeURIComponent(name)+"?v="+encodeURIComponent(s.pay_version||"");const t=document.createElement("div");t.textContent="扫码加客服";d.append(img,t);q.append(d)}}
+  if(!files.length&&!s.pay_text){$("paycard").classList.add("hide");payVersion=s.pay_version;return}
   $("paycard").classList.remove("hide");
   if(payVersion===s.pay_version)return;payVersion=s.pay_version;
   $("paytext").textContent=s.pay_text||"";

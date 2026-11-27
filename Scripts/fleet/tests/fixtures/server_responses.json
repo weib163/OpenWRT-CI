@@ -48,6 +48,7 @@
       }
     ],
     "pay": {
+      "contact": "客服微信 fleet-help，每天 9:00-22:00",
       "files": [
         {
           "name": "wechat.png",
@@ -58,21 +59,33 @@
           "name": "alipay.jpg",
           "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
           "size": 68
+        },
+        {
+          "name": "service.png",
+          "sha256": "f7e8b9377205a3e38e248c0c9bc59bc69bb9374ccc072fb7290acee5b900fed0",
+          "size": 76
         }
       ],
       "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
-      "version": "82a27dea8756bac7"
+      "version": "0b50a4d45d87363a"
     },
     "refresh_seconds": 600,
     "schema": 2,
     "status": "active",
+    "support": {
+      "qr": {
+        "sha256": "366393612eeceb2fc0cf5d092a255fdbda9dfbeb5684c0fdf12a13bd5e553ecb",
+        "size": 72
+      },
+      "url": "https://kf.example.com/?d=4D5E6F"
+    },
     "timezone": {
       "label": "UTC-8",
       "posix": "PST8PDT,M3.2.0,M11.1.0",
       "zone": "America/Los_Angeles"
     },
     "udp": true,
-    "version": "dd9fc0bc69c24896"
+    "version": "3f56f4334ceb347b"
   },
   "active_global": {
     "auto": {
@@ -122,6 +135,7 @@
       }
     ],
     "pay": {
+      "contact": "客服微信 fleet-help，每天 9:00-22:00",
       "files": [
         {
           "name": "wechat.png",
@@ -132,21 +146,33 @@
           "name": "alipay.jpg",
           "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
           "size": 68
+        },
+        {
+          "name": "service.png",
+          "sha256": "f7e8b9377205a3e38e248c0c9bc59bc69bb9374ccc072fb7290acee5b900fed0",
+          "size": 76
         }
       ],
       "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
-      "version": "82a27dea8756bac7"
+      "version": "0b50a4d45d87363a"
     },
     "refresh_seconds": 600,
     "schema": 2,
     "status": "active",
+    "support": {
+      "qr": {
+        "sha256": "366393612eeceb2fc0cf5d092a255fdbda9dfbeb5684c0fdf12a13bd5e553ecb",
+        "size": 72
+      },
+      "url": "https://kf.example.com/?d=4D5E6F"
+    },
     "timezone": {
       "label": "UTC-8",
       "posix": "PST8PDT,M3.2.0,M11.1.0",
       "zone": "America/Los_Angeles"
     },
     "udp": true,
-    "version": "30e756fbc5e20eca"
+    "version": "430ab04bd8d739cd"
   },
   "active_half_hour_tz": {
     "auto": {
@@ -253,6 +279,7 @@
       }
     ],
     "pay": {
+      "contact": "客服微信 fleet-help，每天 9:00-22:00",
       "files": [
         {
           "name": "wechat.png",
@@ -263,21 +290,33 @@
           "name": "alipay.jpg",
           "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
           "size": 68
+        },
+        {
+          "name": "service.png",
+          "sha256": "f7e8b9377205a3e38e248c0c9bc59bc69bb9374ccc072fb7290acee5b900fed0",
+          "size": 76
         }
       ],
       "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
-      "version": "82a27dea8756bac7"
+      "version": "0b50a4d45d87363a"
     },
     "refresh_seconds": 600,
     "schema": 2,
     "status": "active",
+    "support": {
+      "qr": {
+        "sha256": "366393612eeceb2fc0cf5d092a255fdbda9dfbeb5684c0fdf12a13bd5e553ecb",
+        "size": 72
+      },
+      "url": "https://kf.example.com/?d=4D5E6F"
+    },
     "timezone": {
       "label": "UTC-8",
       "posix": "PST8PDT,M3.2.0,M11.1.0",
       "zone": "America/Los_Angeles"
     },
     "udp": false,
-    "version": "bd2603fce3f94058"
+    "version": "8a59ab7266aa5d16"
   },
   "active_plain": {
     "auto": {
@@ -337,6 +376,7 @@
       "198.51.100.7"
     ],
     "pay": {
+      "contact": "客服微信 fleet-help，每天 9:00-22:00",
       "files": [
         {
           "name": "wechat.png",
@@ -347,15 +387,20 @@
           "name": "alipay.jpg",
           "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
           "size": 68
+        },
+        {
+          "name": "service.png",
+          "sha256": "f7e8b9377205a3e38e248c0c9bc59bc69bb9374ccc072fb7290acee5b900fed0",
+          "size": 76
         }
       ],
       "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
-      "version": "82a27dea8756bac7"
+      "version": "0b50a4d45d87363a"
     },
     "refresh_seconds": 600,
     "schema": 2,
     "status": "disabled",
-    "version": "202ccaa6a6f7b612"
+    "version": "ff105c2df9daba64"
   },
   "expired": {
     "direct": [
@@ -364,6 +409,7 @@
     ],
     "expire_at": 1798761600,
     "pay": {
+      "contact": "客服微信 fleet-help，每天 9:00-22:00",
       "files": [
         {
           "name": "wechat.png",
@@ -374,20 +420,32 @@
           "name": "alipay.jpg",
           "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
           "size": 68
+        },
+        {
+          "name": "service.png",
+          "sha256": "f7e8b9377205a3e38e248c0c9bc59bc69bb9374ccc072fb7290acee5b900fed0",
+          "size": 76
         }
       ],
       "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
-      "version": "82a27dea8756bac7"
+      "version": "0b50a4d45d87363a"
     },
     "refresh_seconds": 600,
     "schema": 2,
     "status": "expired",
+    "support": {
+      "qr": {
+        "sha256": "366393612eeceb2fc0cf5d092a255fdbda9dfbeb5684c0fdf12a13bd5e553ecb",
+        "size": 72
+      },
+      "url": "https://kf.example.com/?d=4D5E6F"
+    },
     "timezone": {
       "label": "UTC-8",
       "posix": "PST8PDT,M3.2.0,M11.1.0",
       "zone": "America/Los_Angeles"
     },
-    "version": "4318af17fc9fac75"
+    "version": "3d7bdcc93f1f7be7"
   },
   "limited": {
     "direct": [
@@ -396,6 +454,7 @@
     ],
     "expire_at": 1798761600,
     "pay": {
+      "contact": "客服微信 fleet-help，每天 9:00-22:00",
       "files": [
         {
           "name": "wechat.png",
@@ -406,20 +465,32 @@
           "name": "alipay.jpg",
           "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
           "size": 68
+        },
+        {
+          "name": "service.png",
+          "sha256": "f7e8b9377205a3e38e248c0c9bc59bc69bb9374ccc072fb7290acee5b900fed0",
+          "size": 76
         }
       ],
       "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
-      "version": "82a27dea8756bac7"
+      "version": "0b50a4d45d87363a"
     },
     "refresh_seconds": 600,
     "schema": 2,
     "status": "limited",
+    "support": {
+      "qr": {
+        "sha256": "366393612eeceb2fc0cf5d092a255fdbda9dfbeb5684c0fdf12a13bd5e553ecb",
+        "size": 72
+      },
+      "url": "https://kf.example.com/?d=4D5E6F"
+    },
     "timezone": {
       "label": "UTC-8",
       "posix": "PST8PDT,M3.2.0,M11.1.0",
       "zone": "America/Los_Angeles"
     },
-    "version": "d0e3f1db15d66fe0"
+    "version": "f59be567ff3d4c34"
   },
   "no_nodes": {
     "direct": [
@@ -428,6 +499,7 @@
     ],
     "expire_at": 1798761600,
     "pay": {
+      "contact": "客服微信 fleet-help，每天 9:00-22:00",
       "files": [
         {
           "name": "wechat.png",
@@ -438,20 +510,32 @@
           "name": "alipay.jpg",
           "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
           "size": 68
+        },
+        {
+          "name": "service.png",
+          "sha256": "f7e8b9377205a3e38e248c0c9bc59bc69bb9374ccc072fb7290acee5b900fed0",
+          "size": 76
         }
       ],
       "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
-      "version": "82a27dea8756bac7"
+      "version": "0b50a4d45d87363a"
     },
     "refresh_seconds": 600,
     "schema": 2,
     "status": "no_nodes",
+    "support": {
+      "qr": {
+        "sha256": "366393612eeceb2fc0cf5d092a255fdbda9dfbeb5684c0fdf12a13bd5e553ecb",
+        "size": 72
+      },
+      "url": "https://kf.example.com/?d=4D5E6F"
+    },
     "timezone": {
       "label": "UTC-8",
       "posix": "PST8PDT,M3.2.0,M11.1.0",
       "zone": "America/Los_Angeles"
     },
-    "version": "f52097e2a97b931d"
+    "version": "c3ddce34f64c4567"
   },
   "noip": {
     "auto": {
@@ -501,6 +585,7 @@
       }
     ],
     "pay": {
+      "contact": "客服微信 fleet-help，每天 9:00-22:00",
       "files": [
         {
           "name": "wechat.png",
@@ -511,21 +596,33 @@
           "name": "alipay.jpg",
           "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
           "size": 68
+        },
+        {
+          "name": "service.png",
+          "sha256": "f7e8b9377205a3e38e248c0c9bc59bc69bb9374ccc072fb7290acee5b900fed0",
+          "size": 76
         }
       ],
       "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
-      "version": "82a27dea8756bac7"
+      "version": "0b50a4d45d87363a"
     },
     "refresh_seconds": 600,
     "schema": 2,
     "status": "active",
+    "support": {
+      "qr": {
+        "sha256": "366393612eeceb2fc0cf5d092a255fdbda9dfbeb5684c0fdf12a13bd5e553ecb",
+        "size": 72
+      },
+      "url": "https://kf.example.com/?d=4D5E6F"
+    },
     "timezone": {
       "label": "UTC-8",
       "posix": "PST8PDT,M3.2.0,M11.1.0",
       "zone": "America/Los_Angeles"
     },
     "udp": true,
-    "version": "28fb3a9779dd9be2"
+    "version": "4d1ad78aa65de8da"
   },
   "notice": {
     "auto": {
@@ -576,6 +673,7 @@
     ],
     "notice": "PAY BY 12-01",
     "pay": {
+      "contact": "客服微信 fleet-help，每天 9:00-22:00",
       "files": [
         {
           "name": "wechat.png",
@@ -586,21 +684,33 @@
           "name": "alipay.jpg",
           "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
           "size": 68
+        },
+        {
+          "name": "service.png",
+          "sha256": "f7e8b9377205a3e38e248c0c9bc59bc69bb9374ccc072fb7290acee5b900fed0",
+          "size": 76
         }
       ],
       "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
-      "version": "82a27dea8756bac7"
+      "version": "0b50a4d45d87363a"
     },
     "refresh_seconds": 600,
     "schema": 2,
     "status": "active",
+    "support": {
+      "qr": {
+        "sha256": "366393612eeceb2fc0cf5d092a255fdbda9dfbeb5684c0fdf12a13bd5e553ecb",
+        "size": 72
+      },
+      "url": "https://kf.example.com/?d=4D5E6F"
+    },
     "timezone": {
       "label": "UTC-8",
       "posix": "PST8PDT,M3.2.0,M11.1.0",
       "zone": "America/Los_Angeles"
     },
     "udp": true,
-    "version": "ae5eacd9e7f05b55"
+    "version": "756c723b6f3a9e5d"
   },
   "ota": {
     "board": "jdcloud,re-cs-02",
@@ -612,6 +722,7 @@
   },
   "pay_images": {
     "alipay.jpg": "/9j/4GFsaXBheS1xci1zYW1wbGVhbGlwYXktcXItc2FtcGxlYWxpcGF5LXFyLXNhbXBsZWFsaXBheS1xci1zYW1wbGU=",
+    "service.png": "iVBORw0KGgpzZXJ2aWNlLXFyLXNhbXBsZXNlcnZpY2UtcXItc2FtcGxlc2VydmljZS1xci1zYW1wbGVzZXJ2aWNlLXFyLXNhbXBsZQ==",
     "wechat.png": "iVBORw0KGgp3ZWNoYXQtcXItc2FtcGxld2VjaGF0LXFyLXNhbXBsZXdlY2hhdC1xci1zYW1wbGV3ZWNoYXQtcXItc2FtcGxl"
   },
   "pending": {
@@ -620,6 +731,7 @@
       "198.51.100.7"
     ],
     "pay": {
+      "contact": "客服微信 fleet-help，每天 9:00-22:00",
       "files": [
         {
           "name": "wechat.png",
@@ -630,22 +742,35 @@
           "name": "alipay.jpg",
           "sha256": "1803a43e987c9ace7c81175005bf1b0dbc4af35661036bbbb7851bad25500da9",
           "size": 68
+        },
+        {
+          "name": "service.png",
+          "sha256": "f7e8b9377205a3e38e248c0c9bc59bc69bb9374ccc072fb7290acee5b900fed0",
+          "size": 76
         }
       ],
       "text": "月付 ¥99，季付 ¥279\n付款时备注设备码，付完点“我已付款”",
-      "version": "82a27dea8756bac7"
+      "version": "0b50a4d45d87363a"
     },
     "refresh_seconds": 600,
     "schema": 2,
     "status": "pending",
-    "version": "d8348e9855846478"
+    "support": {
+      "qr": {
+        "sha256": "366393612eeceb2fc0cf5d092a255fdbda9dfbeb5684c0fdf12a13bd5e553ecb",
+        "size": 72
+      },
+      "url": "https://kf.example.com/?d=4D5E6F"
+    },
+    "version": "a0c61f0f20173c14"
   },
   "public_key": "Z84J2IelR9ch3k8VtlVhhs5ycBUlXA7wHBWcBrjqnAw",
+  "support_qr": "iVBORw0KGgprZi1xci1mb3ItNEQ1RTZGa2YtcXItZm9yLTRENUU2RmtmLXFyLWZvci00RDVFNkZrZi1xci1mb3ItNEQ1RTZG",
   "unchanged": {
     "refresh_seconds": 600,
     "schema": 2,
     "status": "unchanged",
-    "version": "dd9fc0bc69c24896"
+    "version": "3f56f4334ceb347b"
   },
   "vless_id": "3f2a9c1e-5b7d-4e8a-9c21-7d4e5f6a8b90"
 }
