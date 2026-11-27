@@ -53,6 +53,9 @@ jobs:
           test -x files/www/fleet-setup/cgi-bin/api
           grep -q '/usr/share/fleet/fleet-setup.lua' files/www/fleet-setup/cgi-bin/api
           test -s files/www/fleet-setup/index.html
+          test -s files/www/fleet-setup/portal.html
+          grep -q "error_page='/cgi-bin/api?a=probe'" files/etc/uci-defaults/98-fleet-setup
+          grep -q '/etc/fleet/portal-clients.json' files/lib/upgrade/keep.d/fleet
 
       - name: sing-box accepts the generated configs (pinned version)
         run: |
